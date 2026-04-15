@@ -26,8 +26,27 @@ La API quedará disponible en:
 ## Endpoints
 
 - `GET /` → estado de la API
+- `GET /health` → healthcheck para monitoreo (Railway/Uptime checks)
 - `POST /extract/sinader` → recibe PDFs y devuelve un Excel
 - `POST /extract/sindrep` → recibe PDFs y devuelve un Excel
+
+## Uso por carpeta (CLI)
+
+Si prefieres ejecutar la extracción localmente desde una carpeta de PDFs (sin subir archivos por API):
+
+```bash
+python -m app.cli
+```
+
+La herramienta te pedirá:
+- Tipo de certificado (`sinader` o `sindrep`)
+- Ruta de la carpeta que contiene los PDFs (búsqueda recursiva)
+
+También puedes usar parámetros:
+
+```bash
+python -m app.cli --source sinader --input-dir ./mis_pdfs --output ./resultado.xlsx
+```
 
 ## Deploy en Railway
 
@@ -42,4 +61,5 @@ uvicorn app.main:app --host 0.0.0.0 --port $PORT
 ## Notas
 
 - Los Excel generados se crean temporalmente por solicitud.
+- Se aceptan content-types comunes de PDF (`application/pdf`, `application/x-pdf`, `application/octet-stream`) para evitar rechazos por variaciones del cliente.
 - Si luego quieres interfaz web, se puede agregar HTML/Jinja o React encima de esta API.
