@@ -13,6 +13,14 @@ from app.sindrep import process_folder as process_sindrep
 
 app = FastAPI(title="Extractor de Certificados", version="1.0.0")
 
+ALLOWED_PDF_CONTENT_TYPES = {
+    "",
+    "application/octet-stream",
+    "application/pdf",
+    "application/x-pdf",
+    "binary/octet-stream",
+}
+
 
 def cleanup_temp_dir(temp_dir: str) -> None:
     shutil.rmtree(temp_dir, ignore_errors=True)
@@ -35,10 +43,13 @@ def save_uploaded_pdfs(files: List[UploadFile], input_dir: Path) -> int:
             )
 
         content_type = (uploaded.content_type or "").lower()
-        if content_type not in ("application/pdf", "application/octet-stream", ""):
+        if content_type not in ALLOWED_PDF_CONTENT_TYPES:
             raise HTTPException(
                 status_code=400,
-                detail=f"El archivo '{original_name}' no tiene un content-type válido de PDF"
+                detail=(
+                    f"El archivo '{original_name}' no tiene un content-type válido de PDF "
+                    f"({content_type or 'vacío'})"
+                ),
             )
 
         safe_name = f"{idx:03d}_{uuid4().hex}_{original_name}"
@@ -70,6 +81,11 @@ def build_excel_response(output_path: Path, download_name: str, temp_dir: str) -
 @app.get("/")
 def healthcheck():
     return {"status": "ok", "message": "API activa"}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "extractor-certificados", "version": app.version}
 
 
 @app.post("/extract/sinader")
