@@ -70,6 +70,10 @@ Si quieres mostrar tus logos en la cabecera, agrega archivos en:
 - `assets/logo_left.png`
 - `assets/logo_right.png`
 
+También puedes configurarlos por variables de entorno:
+- `GT_LOGO_LEFT_URL`
+- `GT_LOGO_RIGHT_URL`
+
 ## Deploy en Railway
 
 1. Sube este proyecto a GitHub.
