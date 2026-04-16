@@ -80,7 +80,7 @@ Si quieres mostrar tus logos en la cabecera, agrega archivos en:
 4. Verifica que el Start Command sea:
 
 ```bash
-bash -lc 'if [ "$APP_MODE" = "streamlit" ]; then python3 -m streamlit run app/streamlit_app.py --server.address 0.0.0.0 --server.port ${PORT:-8501} --server.headless true; else python3 -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}; fi'
+bash -lc 'if [ "$APP_MODE" = "streamlit" ]; then python -m streamlit run app/streamlit_app.py --server.address 0.0.0.0 --server.port ${PORT:-8501} --server.headless true; else python -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}; fi'
 ```
 
 ## Notas
