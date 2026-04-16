@@ -24,14 +24,17 @@ PRIMARY = "#0A7B3E"
 SECONDARY = "#5BBF73"
 DARK = "#0F2A1D"
 LIGHT_BG = "#F4FBF6"
+DEFAULT_RIGHT_LOGO_URL = "https://cdn.jsdelivr.net/gh/sebastianprietoa/extractor-residuos@main/assets/logo_right.png"
 
 
-def _logo_source(filename: str, env_var: str) -> str | None:
+def _logo_source(filename: str, env_var: str, default_url: str | None = None) -> str | None:
     env_value = os.getenv(env_var, "").strip()
     if env_value:
         return env_value
     local_path = Path("assets") / filename
-    return str(local_path) if local_path.exists() else None
+    if local_path.exists():
+        return str(local_path)
+    return default_url
 
 
 def _render_header() -> None:
@@ -106,7 +109,7 @@ def _render_header() -> None:
 
     left, center, right = st.columns([1, 3, 1])
     logo_left = _logo_source("logo_left.png", "GT_LOGO_LEFT_URL")
-    logo_right = _logo_source("logo_right.png", "GT_LOGO_RIGHT_URL")
+    logo_right = _logo_source("logo_right.png", "GT_LOGO_RIGHT_URL", DEFAULT_RIGHT_LOGO_URL)
     with left:
         if logo_left:
             st.image(logo_left, use_container_width=True)

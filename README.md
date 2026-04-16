@@ -74,6 +74,9 @@ También puedes configurarlos por variables de entorno:
 - `GT_LOGO_LEFT_URL`
 - `GT_LOGO_RIGHT_URL`
 
+Si `GT_LOGO_RIGHT_URL` no está definida, la UI usa por defecto:
+- `https://cdn.jsdelivr.net/gh/sebastianprietoa/extractor-residuos@main/assets/logo_right.png`
+
 ## Deploy en Railway
 
 1. Sube este proyecto a GitHub.
