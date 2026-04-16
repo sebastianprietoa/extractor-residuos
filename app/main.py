@@ -28,6 +28,14 @@ ALLOWED_PDF_CONTENT_TYPES = {
     "binary/octet-stream",
 }
 
+ALLOWED_PDF_CONTENT_TYPES = {
+    "",
+    "application/octet-stream",
+    "application/pdf",
+    "application/x-pdf",
+    "binary/octet-stream",
+}
+
 
 def cleanup_temp_dir(temp_dir: str) -> None:
     shutil.rmtree(temp_dir, ignore_errors=True)
