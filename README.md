@@ -54,6 +54,22 @@ python -m app.cli --source sinader --input-dir ./mis_pdfs --output ./resultado.x
 python -m app.cli --source ambos --input-dir ./mis_pdfs
 ```
 
+## Interfaz amigable con Streamlit
+
+Para una experiencia más simple de usuario final (con opción de logos):
+
+```bash
+streamlit run app/streamlit_app.py
+```
+
+Luego abre la URL que te muestre Streamlit (normalmente `http://localhost:8501`).
+
+### Logos de empresa
+
+Si quieres mostrar tus logos en la cabecera, agrega archivos en:
+- `assets/logo_left.png`
+- `assets/logo_right.png`
+
 ## Deploy en Railway
 
 1. Sube este proyecto a GitHub.
