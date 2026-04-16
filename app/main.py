@@ -5,7 +5,7 @@ from typing import Annotated, List
 from uuid import uuid4
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from starlette.background import BackgroundTask
 
 from app.sinader import process_folder as process_sinader
@@ -20,13 +20,84 @@ app = FastAPI(
     ),
 )
 
-ALLOWED_PDF_CONTENT_TYPES = {
-    "",
-    "application/octet-stream",
-    "application/pdf",
-    "application/x-pdf",
-    "binary/octet-stream",
-}
+WEB_UI_HTML = """
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Extractor de Certificados</title>
+    <style>
+      body { font-family: Arial, sans-serif; max-width: 860px; margin: 40px auto; padding: 0 16px; }
+      h1 { margin-bottom: 8px; }
+      .box { border: 1px solid #ddd; border-radius: 10px; padding: 16px; margin-top: 16px; }
+      label { font-weight: 600; display: block; margin: 10px 0 6px; }
+      select, input, button { font-size: 15px; }
+      input[type="file"] { width: 100%; }
+      button { margin-top: 14px; padding: 10px 16px; cursor: pointer; }
+      .muted { color: #666; font-size: 14px; }
+      #status { margin-top: 12px; white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <h1>Extractor SINADER / SINDREP</h1>
+    <p class="muted">Selecciona una carpeta local con PDFs. El sistema sube los archivos y devuelve un Excel.</p>
+
+    <div class="box">
+      <label for="source">Tipo de extracción</label>
+      <select id="source">
+        <option value="sinader">SINADER</option>
+        <option value="sindrep">SINDREP</option>
+      </select>
+
+      <label for="folder">Carpeta con PDFs</label>
+      <input id="folder" type="file" webkitdirectory directory multiple accept=".pdf,application/pdf" />
+      <p class="muted">Nota: por seguridad del navegador, se selecciona la carpeta y se suben los archivos PDF, no la ruta del disco.</p>
+
+      <button id="run">Procesar y descargar Excel</button>
+      <div id="status"></div>
+    </div>
+
+    <script>
+      const statusEl = document.getElementById("status");
+      document.getElementById("run").addEventListener("click", async () => {
+        const source = document.getElementById("source").value;
+        const files = Array.from(document.getElementById("folder").files || []).filter(f => f.name.toLowerCase().endsWith(".pdf"));
+
+        if (!files.length) {
+          statusEl.textContent = "⚠️ Debes seleccionar una carpeta que contenga PDFs.";
+          return;
+        }
+
+        statusEl.textContent = `Procesando ${files.length} PDF(s)...`;
+        const form = new FormData();
+        files.forEach(f => form.append("files", f));
+
+        try {
+          const resp = await fetch(`/extract/${source}`, { method: "POST", body: form });
+          if (!resp.ok) {
+            const detail = await resp.text();
+            statusEl.textContent = `❌ Error (${resp.status}): ${detail}`;
+            return;
+          }
+          const blob = await resp.blob();
+          const url = window.URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `${source}_output.xlsx`;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          window.URL.revokeObjectURL(url);
+          statusEl.textContent = "✅ Excel generado y descargado.";
+        } catch (err) {
+          statusEl.textContent = `❌ Error de red: ${err}`;
+        }
+      });
+    </script>
+  </body>
+</html>
+"""
 
 ALLOWED_PDF_CONTENT_TYPES = {
     "",
@@ -102,9 +173,20 @@ def healthcheck():
     return {
         "status": "ok",
         "message": "API activa",
+        "ui": "/ui",
         "docs": "/docs",
         "openapi": "/openapi.json",
     }
+
+
+@app.get(
+    "/ui",
+    summary="Interfaz web para subir carpeta de PDFs",
+    tags=["Sistema"],
+    response_class=HTMLResponse,
+)
+def ui():
+    return HTMLResponse(WEB_UI_HTML)
 
 
 @app.get(
@@ -120,6 +202,13 @@ def health():
     "/extract/sinader",
     summary="Extraer PDFs SINADER a Excel",
     tags=["Extracción"],
+    response_class=FileResponse,
+    responses={
+        200: {
+            "description": "Excel de salida",
+            "content": {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {}},
+        }
+    },
 )
 async def extract_sinader(
     files: Annotated[List[UploadFile], File(..., description="Sube uno o más archivos PDF")]
@@ -163,6 +252,13 @@ async def extract_sinader(
     "/extract/sindrep",
     summary="Extraer PDFs SINDREP a Excel",
     tags=["Extracción"],
+    response_class=FileResponse,
+    responses={
+        200: {
+            "description": "Excel de salida",
+            "content": {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {}},
+        }
+    },
 )
 async def extract_sindrep(
     files: Annotated[List[UploadFile], File(..., description="Sube uno o más archivos PDF")]

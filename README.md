@@ -26,6 +26,7 @@ La API quedará disponible en:
 ## Endpoints
 
 - `GET /` → estado de la API + accesos rápidos a `/docs` y `/openapi.json`
+- `GET /ui` → interfaz web para seleccionar carpeta con PDFs y descargar Excel
 - `GET /health` → healthcheck para monitoreo (Railway/Uptime checks)
 - `POST /extract/sinader` → recibe PDFs y devuelve un Excel
 - `POST /extract/sindrep` → recibe PDFs y devuelve un Excel
