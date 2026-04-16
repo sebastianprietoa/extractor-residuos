@@ -20,14 +20,6 @@ def _ask_non_empty(prompt: str) -> str:
         print("⚠️  Debes ingresar un valor.")
 
 
-def _ask_source() -> str:
-    while True:
-        source = _ask_non_empty("Tipo de certificado [sinader/sindrep]: ").lower()
-        if source in {"sinader", "sindrep"}:
-            return source
-        print("⚠️  Opción inválida. Usa 'sinader' o 'sindrep'.")
-
-
 def _resolve_extractor(source: str) -> ExtractorFn:
     return process_sinader if source == "sinader" else process_sindrep
 
@@ -43,8 +35,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--source",
-        choices=["sinader", "sindrep"],
-        help="Tipo de certificado a procesar.",
+        choices=["sinader", "sindrep", "ambos"],
+        default="ambos",
+        help="Tipo de certificado a procesar. Por defecto: ambos.",
     )
     parser.add_argument(
         "--input-dir",
@@ -61,16 +54,26 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    source = args.source or _ask_source()
     input_dir_raw = args.input_dir or _ask_non_empty("Ruta de carpeta con PDFs: ")
     input_dir = Path(input_dir_raw).expanduser().resolve()
     if not input_dir.exists() or not input_dir.is_dir():
         raise FileNotFoundError(f"La carpeta no existe o no es válida: {input_dir}")
 
+    source = args.source
+
+    if source == "ambos":
+        sinader_output = _default_output("sinader")
+        sindrep_output = _default_output("sindrep")
+        process_sinader(str(input_dir), str(sinader_output))
+        process_sindrep(str(input_dir), str(sindrep_output))
+        print("✅ Proceso finalizado.")
+        print(f"   - SINADER: {sinader_output}")
+        print(f"   - SINDREP: {sindrep_output}")
+        return
+
     output = Path(args.output).expanduser().resolve() if args.output else _default_output(source)
     extractor = _resolve_extractor(source)
     extractor(str(input_dir), str(output))
-
     print(f"✅ Proceso finalizado. Excel generado en:\n{output}")
 
 

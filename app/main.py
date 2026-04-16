@@ -11,7 +11,22 @@ from starlette.background import BackgroundTask
 from app.sinader import process_folder as process_sinader
 from app.sindrep import process_folder as process_sindrep
 
-app = FastAPI(title="Extractor de Certificados", version="1.0.0")
+app = FastAPI(
+    title="Extractor de Certificados",
+    version="1.0.0",
+    description=(
+        "API para procesar certificados PDF de SINADER y SINDREP.\n\n"
+        "Sube uno o más PDF por endpoint y recibirás un archivo Excel con los datos extraídos."
+    ),
+)
+
+ALLOWED_PDF_CONTENT_TYPES = {
+    "",
+    "application/octet-stream",
+    "application/pdf",
+    "application/x-pdf",
+    "binary/octet-stream",
+}
 
 ALLOWED_PDF_CONTENT_TYPES = {
     "",
@@ -78,17 +93,34 @@ def build_excel_response(output_path: Path, download_name: str, temp_dir: str) -
     )
 
 
-@app.get("/")
+@app.get(
+    "/",
+    summary="Estado de la API",
+    tags=["Sistema"],
+)
 def healthcheck():
-    return {"status": "ok", "message": "API activa"}
+    return {
+        "status": "ok",
+        "message": "API activa",
+        "docs": "/docs",
+        "openapi": "/openapi.json",
+    }
 
 
-@app.get("/health")
+@app.get(
+    "/health",
+    summary="Healthcheck para monitoreo",
+    tags=["Sistema"],
+)
 def health():
     return {"status": "ok", "service": "extractor-certificados", "version": app.version}
 
 
-@app.post("/extract/sinader")
+@app.post(
+    "/extract/sinader",
+    summary="Extraer PDFs SINADER a Excel",
+    tags=["Extracción"],
+)
 async def extract_sinader(
     files: Annotated[List[UploadFile], File(..., description="Sube uno o más archivos PDF")]
 ):
@@ -127,7 +159,11 @@ async def extract_sinader(
                 pass
 
 
-@app.post("/extract/sindrep")
+@app.post(
+    "/extract/sindrep",
+    summary="Extraer PDFs SINDREP a Excel",
+    tags=["Extracción"],
+)
 async def extract_sindrep(
     files: Annotated[List[UploadFile], File(..., description="Sube uno o más archivos PDF")]
 ):

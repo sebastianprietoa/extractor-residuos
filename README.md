@@ -25,7 +25,7 @@ La API quedará disponible en:
 
 ## Endpoints
 
-- `GET /` → estado de la API
+- `GET /` → estado de la API + accesos rápidos a `/docs` y `/openapi.json`
 - `GET /health` → healthcheck para monitoreo (Railway/Uptime checks)
 - `POST /extract/sinader` → recibe PDFs y devuelve un Excel
 - `POST /extract/sindrep` → recibe PDFs y devuelve un Excel
@@ -39,13 +39,18 @@ python -m app.cli
 ```
 
 La herramienta te pedirá:
-- Tipo de certificado (`sinader` o `sindrep`)
 - Ruta de la carpeta que contiene los PDFs (búsqueda recursiva)
+
+Por defecto procesa **ambos tipos** y genera:
+- `sinader_output_YYYYMMDD_HHMMSS.xlsx`
+- `sindrep_output_YYYYMMDD_HHMMSS.xlsx`
 
 También puedes usar parámetros:
 
 ```bash
 python -m app.cli --source sinader --input-dir ./mis_pdfs --output ./resultado.xlsx
+# o:
+python -m app.cli --source ambos --input-dir ./mis_pdfs
 ```
 
 ## Deploy en Railway
