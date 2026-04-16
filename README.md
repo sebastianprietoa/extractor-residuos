@@ -74,10 +74,13 @@ Si quieres mostrar tus logos en la cabecera, agrega archivos en:
 
 1. Sube este proyecto a GitHub.
 2. En Railway crea un proyecto desde ese repositorio.
-3. Verifica que el Start Command sea:
+3. Configura variable de entorno `APP_MODE` según lo que quieras publicar:
+   - `fastapi` (default): API + docs (`/docs`, `/ui`)
+   - `streamlit`: interfaz Streamlit en la raíz del dominio
+4. Verifica que el Start Command sea:
 
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port $PORT
+bash -lc 'if [ "$APP_MODE" = "streamlit" ]; then streamlit run app/streamlit_app.py --server.address 0.0.0.0 --server.port ${PORT:-8501} --server.headless true; else uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}; fi'
 ```
 
 ## Notas
