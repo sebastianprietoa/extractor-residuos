@@ -107,12 +107,7 @@ def _render_header() -> None:
         unsafe_allow_html=True,
     )
 
-    left, center, right = st.columns([1, 3, 1])
-    logo_left = _logo_source("logo_left.png", "GT_LOGO_LEFT_URL")
-    logo_right = _logo_source("logo_right.png", "GT_LOGO_RIGHT_URL", DEFAULT_RIGHT_LOGO_URL)
-    with left:
-        if logo_left:
-            st.image(logo_left, use_container_width=True)
+    _, center, _ = st.columns([1, 3, 1])
     with center:
         st.markdown("<span class='pill'>Gestión sustentable</span>", unsafe_allow_html=True)
         st.markdown("<p class='main-title'>Extractor SINADER / SINDREP</p>", unsafe_allow_html=True)
@@ -120,9 +115,6 @@ def _render_header() -> None:
             "<p class='subtitle'>Sube tus PDFs, procesa con un clic y descarga tu Excel listo para usar.</p>",
             unsafe_allow_html=True,
         )
-    with right:
-        if logo_right:
-            st.image(logo_right, use_container_width=True)
 
 
 def _save_uploads(uploaded_files: Iterable[object], input_dir: Path) -> int:
@@ -163,16 +155,19 @@ def main() -> None:
             index=2,
         )
         st.caption("Tip: para ambos tipos se descarga un ZIP con dos Excel.")
+        branding_logo = _logo_source("logo_right.png", "GT_LOGO_RIGHT_URL", DEFAULT_RIGHT_LOGO_URL)
         st.markdown(
             f"""
             <div style="margin-top: 12px; padding: 10px; border-radius: 10px; background: #EAF7EE; border: 1px solid #CEEAD6; color: {DARK};">
               <b>Branding</b><br/>
-              Puedes usar tus logos con variables:
-              <code>GT_LOGO_LEFT_URL</code> y <code>GT_LOGO_RIGHT_URL</code>
+              Puedes usar tu logo con la variable:
+              <code>GT_LOGO_RIGHT_URL</code>
             </div>
             """,
             unsafe_allow_html=True,
         )
+        if branding_logo:
+            st.image(branding_logo, use_container_width=True)
 
     st.markdown("<div class='box'>", unsafe_allow_html=True)
     uploads = st.file_uploader(

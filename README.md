@@ -67,11 +67,9 @@ Luego abre la URL que te muestre Streamlit (normalmente `http://localhost:8501`)
 ### Logos de empresa
 
 Si quieres mostrar tus logos en la cabecera, agrega archivos en:
-- `assets/logo_left.png`
 - `assets/logo_right.png`
 
-También puedes configurarlos por variables de entorno:
-- `GT_LOGO_LEFT_URL`
+También puedes configurarlo por variable de entorno:
 - `GT_LOGO_RIGHT_URL`
 
 Si `GT_LOGO_RIGHT_URL` no está definida, la UI usa por defecto:
