@@ -38,6 +38,22 @@ def _logo_source(filename: str, env_var: str, default_url: str | None = None) ->
     return default_url
 
 
+def _pick_folder_with_explorer() -> str:
+    """Abre selector de carpetas local (solo útil cuando Streamlit corre en tu PC)."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        folder = filedialog.askdirectory(title="Selecciona carpeta con certificados PDF")
+        root.destroy()
+        return folder or ""
+    except Exception:
+        return ""
+
+
 def _render_header() -> None:
     st.markdown(
         """
@@ -169,15 +185,19 @@ def main() -> None:
                 st.session_state.source_mode = mode
         source = st.session_state.source_mode
         st.caption(f"Modo actual: {source}")
-        st.caption("Puedes subir PDFs desde el explorador o usar una ruta de carpeta en el servidor.")
+        st.caption("Puedes subir PDFs o escoger carpeta desde explorador local (si ejecutas en tu PC).")
         branding_logo = _logo_source("logo_right.png", "GT_LOGO_RIGHT_URL", DEFAULT_RIGHT_LOGO_URL)
         if branding_logo:
             st.image(branding_logo, use_container_width=True)
 
     st.markdown("<div class='box'>", unsafe_allow_html=True)
-    input_mode = st.radio("Modo de entrada", options=["Subir PDFs (explorador)", "Escoger carpeta (servidor)"], horizontal=True)
+    input_mode = st.radio(
+        "Modo de entrada",
+        options=["Subir PDFs (explorador)", "Escoger carpeta (explorador local)"],
+        horizontal=True,
+    )
     uploads = []
-    folder_path_input = ""
+    folder_path_input = st.session_state.get("selected_local_folder", "")
     if input_mode == "Subir PDFs (explorador)":
         uploads = st.file_uploader(
             "📎 Arrastra una carpeta o selecciona múltiples PDFs",
@@ -186,11 +206,15 @@ def main() -> None:
             help="Abre la carpeta local en el explorador y selecciona todos los PDFs.",
         )
     else:
-        folder_path_input = st.text_input(
-            "Ruta de carpeta en servidor",
-            placeholder="/app/data/certificados",
-            help="Debe ser una carpeta válida dentro del servidor donde corre Streamlit.",
-        )
+        c1, c2 = st.columns([1, 3])
+        if c1.button("📂 Buscar carpeta", use_container_width=True):
+            selected = _pick_folder_with_explorer()
+            if selected:
+                st.session_state["selected_local_folder"] = selected
+                folder_path_input = selected
+            else:
+                st.warning("No se pudo abrir el explorador. Si estás en servidor, usa 'Subir PDFs (explorador)'.")
+        c2.text_input("Carpeta seleccionada", value=folder_path_input, disabled=True, key="selected_folder_preview")
 
     run = st.button("✨ Procesar y descargar", type="primary", use_container_width=True)
     total_files = len(uploads or []) if input_mode == "Subir PDFs (explorador)" else 0
@@ -210,10 +234,10 @@ def main() -> None:
     if not run:
         return
 
-    if input_mode == "Escoger carpeta (servidor)":
+    if input_mode == "Escoger carpeta (explorador local)":
         folder_path = Path(folder_path_input.strip())
         if not folder_path_input.strip() or not folder_path.exists() or not folder_path.is_dir():
-            st.warning("Debes indicar una carpeta válida del servidor.")
+            st.warning("Debes escoger una carpeta local válida desde el explorador.")
             return
         with st.spinner("Procesando carpeta..."):
             with tempfile.TemporaryDirectory(prefix="streamlit_extract_folder_") as temp_dir:

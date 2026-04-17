@@ -72,7 +72,7 @@ En la barra lateral puedes elegir:
 
 La UI permite dos modos de entrada:
 - `Subir PDFs (explorador)`
-- `Escoger carpeta (servidor)`
+- `Escoger carpeta (explorador local)` (abre selector de carpeta cuando ejecutas Streamlit en tu PC)
 
 ### Logos de empresa
 
