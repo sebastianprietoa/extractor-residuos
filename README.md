@@ -104,3 +104,4 @@ bash -lc 'if [ "$APP_MODE" = "streamlit" ]; then /app/.venv/bin/python -m stream
 - Se aceptan content-types comunes de PDF (`application/pdf`, `application/x-pdf`, `application/octet-stream`) para evitar rechazos por variaciones del cliente.
 - Si luego quieres interfaz web, se puede agregar HTML/Jinja o React encima de esta API.
 - Para catálogo SINADER en Excel se prioriza la hoja `LER_completo_842` (si existe) y columnas como `Código LER` + `Entry official name (EN)`/`Descripción`; también filtra `¿Declarable en SINADER? = Sí` cuando esa columna está presente.
+- Para mapear `Tratamiento` a nombres `DEFRA` se usa la hoja `Tratamiento_SINADER`; si no existe, se aplica un mapeo base (`Reutilización→Re-use`, `Reciclaje→Open-loop`, `Combustión→Combustion`, `Vertedero→Landfill`, `Anaerobic digestion→Anaerobic digestion`).
