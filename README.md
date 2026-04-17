@@ -64,6 +64,12 @@ streamlit run app/streamlit_app.py
 
 Luego abre la URL que te muestre Streamlit (normalmente `http://localhost:8501`).
 
+En la barra lateral puedes elegir:
+- `SINADER`
+- `SINDREP`
+- `AMBOS`
+- `AUTOCONTROL` (acepta subida de PDFs o ruta de carpeta en servidor)
+
 ### Logos de empresa
 
 Si quieres mostrar tus logos en la cabecera, agrega archivos en:

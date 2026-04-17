@@ -9,6 +9,7 @@ from typing import Iterable
 
 import streamlit as st
 
+from app.autocontrol import process_folder as process_autocontrol
 from app.sinader import process_folder as process_sinader
 from app.sindrep import process_folder as process_sindrep
 
@@ -151,21 +152,37 @@ def main() -> None:
         st.header("⚙️ Configuración")
         source = st.selectbox(
             "Tipo de extracción",
-            options=["SINADER", "SINDREP", "AMBOS"],
+            options=["SINADER", "SINDREP", "AMBOS", "AUTOCONTROL"],
             index=2,
         )
-        st.caption("Tip: para ambos tipos se descarga un ZIP con dos Excel.")
+        if source == "AUTOCONTROL":
+            st.caption("Modo AUTOCONTROL: puedes subir PDFs o indicar ruta de carpeta del servidor.")
+        else:
+            st.caption("Tip: para ambos tipos se descarga un ZIP con dos Excel.")
         branding_logo = _logo_source("logo_right.png", "GT_LOGO_RIGHT_URL", DEFAULT_RIGHT_LOGO_URL)
         if branding_logo:
             st.image(branding_logo, use_container_width=True)
 
     st.markdown("<div class='box'>", unsafe_allow_html=True)
-    uploads = st.file_uploader(
-        "📎 Arrastra una carpeta o selecciona múltiples PDFs",
-        type=["pdf"],
-        accept_multiple_files=True,
-        help="Puedes seleccionar múltiples PDFs. La app procesa todo en una sola ejecución.",
-    )
+    input_mode = "Subir PDFs"
+    folder_path_input = ""
+    if source == "AUTOCONTROL":
+        input_mode = st.radio("Modo de entrada", options=["Subir PDFs", "Ruta carpeta servidor"], horizontal=True)
+    uploads = []
+    if input_mode == "Subir PDFs":
+        uploads = st.file_uploader(
+            "📎 Arrastra una carpeta o selecciona múltiples PDFs",
+            type=["pdf"],
+            accept_multiple_files=True,
+            help="Puedes seleccionar múltiples PDFs. La app procesa todo en una sola ejecución.",
+        )
+    else:
+        folder_path_input = st.text_input(
+            "Ruta de carpeta en el servidor",
+            placeholder="/app/data/autocontrol",
+            help="Esta ruta debe existir en el servidor donde corre Streamlit.",
+        )
+
     run = st.button("✨ Procesar y descargar", type="primary", use_container_width=True)
     total_files = len(uploads or [])
     total_size_mb = round(sum(getattr(f, "size", 0) for f in (uploads or [])) / (1024 * 1024), 2)
@@ -184,6 +201,26 @@ def main() -> None:
     if not run:
         return
 
+    if source == "AUTOCONTROL" and input_mode == "Ruta carpeta servidor":
+        folder_path = Path(folder_path_input.strip())
+        if not folder_path_input.strip() or not folder_path.exists() or not folder_path.is_dir():
+            st.warning("Debes indicar una carpeta válida del servidor.")
+            return
+        with st.spinner("Procesando AUTOCONTROL desde carpeta..."):
+            with tempfile.TemporaryDirectory(prefix="streamlit_autocontrol_") as temp_dir:
+                output = Path(temp_dir) / "autocontrol_output.xlsx"
+                process_autocontrol(str(folder_path), str(output))
+                data = output.read_bytes()
+        st.success("Proceso AUTOCONTROL completado.")
+        st.download_button(
+            label="Descargar Excel AUTOCONTROL",
+            data=data,
+            file_name="autocontrol_output.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+        return
+
     if not uploads:
         st.warning("Debes subir al menos un PDF.")
         return
@@ -197,6 +234,20 @@ def main() -> None:
             total = _save_uploads(uploads, input_dir)
             if total == 0:
                 st.error("No se encontraron PDFs válidos en los archivos cargados.")
+                return
+
+            if source == "AUTOCONTROL":
+                output = tmp / "autocontrol_output.xlsx"
+                process_autocontrol(str(input_dir), str(output))
+                data = _read_file_bytes(output)
+                st.success(f"Proceso AUTOCONTROL completado. PDFs procesados: {total}")
+                st.download_button(
+                    label="Descargar Excel AUTOCONTROL",
+                    data=data,
+                    file_name=output.name,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
                 return
 
             outputs: list[tuple[str, bytes]] = []
