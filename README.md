@@ -103,3 +103,4 @@ bash -lc 'if [ "$APP_MODE" = "streamlit" ]; then /app/.venv/bin/python -m stream
 - Los Excel generados se crean temporalmente por solicitud.
 - Se aceptan content-types comunes de PDF (`application/pdf`, `application/x-pdf`, `application/octet-stream`) para evitar rechazos por variaciones del cliente.
 - Si luego quieres interfaz web, se puede agregar HTML/Jinja o React encima de esta API.
+- Para catálogo SINADER en Excel se prioriza la hoja `LER_completo_842` (si existe) y columnas como `Código LER` + `Entry official name (EN)`/`Descripción`; también filtra `¿Declarable en SINADER? = Sí` cuando esa columna está presente.
