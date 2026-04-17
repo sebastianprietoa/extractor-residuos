@@ -156,16 +156,6 @@ def main() -> None:
         )
         st.caption("Tip: para ambos tipos se descarga un ZIP con dos Excel.")
         branding_logo = _logo_source("logo_right.png", "GT_LOGO_RIGHT_URL", DEFAULT_RIGHT_LOGO_URL)
-        st.markdown(
-            f"""
-            <div style="margin-top: 12px; padding: 10px; border-radius: 10px; background: #EAF7EE; border: 1px solid #CEEAD6; color: {DARK};">
-              <b>Branding</b><br/>
-              Puedes usar tu logo con la variable:
-              <code>GT_LOGO_RIGHT_URL</code>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
         if branding_logo:
             st.image(branding_logo, use_container_width=True)
 
