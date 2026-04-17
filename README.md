@@ -70,6 +70,10 @@ En la barra lateral puedes elegir:
 - `AMBOS`
 - `AUTOCONTROL` (subida de PDFs desde carpeta local usando el explorador)
 
+La UI permite dos modos de entrada:
+- `Subir PDFs (explorador)`
+- `Escoger carpeta (servidor)`
+
 ### Logos de empresa
 
 Si quieres mostrar tus logos en la cabecera, agrega archivos en:

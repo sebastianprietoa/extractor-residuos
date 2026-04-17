@@ -103,6 +103,11 @@ def _render_header() -> None:
                 font-size: 1rem;
                 color: """ + PRIMARY + """;
             }
+            .mode-btn button {
+                font-size: 0.92rem !important;
+                min-height: 52px !important;
+                text-align: left !important;
+            }
         </style>
         """,
         unsafe_allow_html=True,
@@ -150,39 +155,45 @@ def main() -> None:
 
     with st.sidebar:
         st.header("⚙️ Configuración")
-        source_icons = {
-            "SINADER": "♻️",
-            "SINDREP": "🏭",
-            "AMBOS": "🧩",
-            "AUTOCONTROL": "🧪",
+        source_labels = {
+            "SINADER": "♻️ Certificado SINADER",
+            "SINDREP": "🏭 Certificado SINDREP",
+            "AUTOCONTROL": "🧪 Certificado Autocontrol",
+            "AMBOS": "🧩 Certificados SINADER + SINDREP",
         }
         if "source_mode" not in st.session_state:
             st.session_state.source_mode = "AMBOS"
         st.caption("Selecciona función")
-        cols = st.columns(4)
-        for i, (mode, icon) in enumerate(source_icons.items()):
-            if cols[i].button(icon, key=f"btn_mode_{mode}", use_container_width=True):
+        for mode, label in source_labels.items():
+            if st.button(label, key=f"btn_mode_{mode}", use_container_width=True):
                 st.session_state.source_mode = mode
         source = st.session_state.source_mode
         st.caption(f"Modo actual: {source}")
-        if source == "AUTOCONTROL":
-            st.caption("AUTOCONTROL: selecciona una carpeta local y sube sus PDFs desde el explorador.")
-        else:
-            st.caption("Tip: para ambos tipos se descarga un ZIP con dos Excel.")
+        st.caption("Puedes subir PDFs desde el explorador o usar una ruta de carpeta en el servidor.")
         branding_logo = _logo_source("logo_right.png", "GT_LOGO_RIGHT_URL", DEFAULT_RIGHT_LOGO_URL)
         if branding_logo:
             st.image(branding_logo, use_container_width=True)
 
     st.markdown("<div class='box'>", unsafe_allow_html=True)
-    uploads = st.file_uploader(
-        "📎 Arrastra una carpeta o selecciona múltiples PDFs",
-        type=["pdf"],
-        accept_multiple_files=True,
-        help="En AUTOCONTROL abre el explorador, entra a la carpeta local y selecciona todos los PDFs.",
-    )
+    input_mode = st.radio("Modo de entrada", options=["Subir PDFs (explorador)", "Escoger carpeta (servidor)"], horizontal=True)
+    uploads = []
+    folder_path_input = ""
+    if input_mode == "Subir PDFs (explorador)":
+        uploads = st.file_uploader(
+            "📎 Arrastra una carpeta o selecciona múltiples PDFs",
+            type=["pdf"],
+            accept_multiple_files=True,
+            help="Abre la carpeta local en el explorador y selecciona todos los PDFs.",
+        )
+    else:
+        folder_path_input = st.text_input(
+            "Ruta de carpeta en servidor",
+            placeholder="/app/data/certificados",
+            help="Debe ser una carpeta válida dentro del servidor donde corre Streamlit.",
+        )
 
     run = st.button("✨ Procesar y descargar", type="primary", use_container_width=True)
-    total_files = len(uploads or [])
+    total_files = len(uploads or []) if input_mode == "Subir PDFs (explorador)" else 0
     total_size_mb = round(sum(getattr(f, "size", 0) for f in (uploads or [])) / (1024 * 1024), 2)
     st.markdown(
         f"""
@@ -197,6 +208,47 @@ def main() -> None:
     st.markdown("</div>", unsafe_allow_html=True)
 
     if not run:
+        return
+
+    if input_mode == "Escoger carpeta (servidor)":
+        folder_path = Path(folder_path_input.strip())
+        if not folder_path_input.strip() or not folder_path.exists() or not folder_path.is_dir():
+            st.warning("Debes indicar una carpeta válida del servidor.")
+            return
+        with st.spinner("Procesando carpeta..."):
+            with tempfile.TemporaryDirectory(prefix="streamlit_extract_folder_") as temp_dir:
+                tmp = Path(temp_dir)
+                if source == "SINADER":
+                    output = tmp / "sinader_output.xlsx"
+                    process_sinader(str(folder_path), str(output))
+                    data = output.read_bytes()
+                    filename = output.name
+                    mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                elif source == "SINDREP":
+                    output = tmp / "sindrep_output.xlsx"
+                    process_sindrep(str(folder_path), str(output))
+                    data = output.read_bytes()
+                    filename = output.name
+                    mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                elif source == "AUTOCONTROL":
+                    output = tmp / "autocontrol_output.xlsx"
+                    process_autocontrol(str(folder_path), str(output))
+                    data = output.read_bytes()
+                    filename = output.name
+                    mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                else:
+                    out_sinader = tmp / "sinader_output.xlsx"
+                    out_sindrep = tmp / "sindrep_output.xlsx"
+                    process_sinader(str(folder_path), str(out_sinader))
+                    process_sindrep(str(folder_path), str(out_sindrep))
+                    data = _zip_outputs([
+                        (out_sinader.name, _read_file_bytes(out_sinader)),
+                        (out_sindrep.name, _read_file_bytes(out_sindrep)),
+                    ])
+                    filename = "resultados_extraccion.zip"
+                    mime = "application/zip"
+        st.success(f"Proceso completado desde carpeta: {folder_path}")
+        st.download_button("Descargar resultado", data=data, file_name=filename, mime=mime, use_container_width=True)
         return
 
     if not uploads:
