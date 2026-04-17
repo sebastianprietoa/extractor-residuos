@@ -75,7 +75,7 @@ def _render_header() -> None:
         """
         <style>
             .stApp { background: """ + LIGHT_BG + """; }
-            .main-title { font-size: 2.9rem; font-weight: 800; margin-bottom: 0; color: """ + DARK + """; }
+            .main-title { font-size: 3.4rem; font-weight: 800; margin-bottom: 0; color: """ + DARK + """; }
             .subtitle { color: #496153; margin-top: 0.15rem; font-size: 1.05rem; }
             .box {
                 border: 1px solid #d2e9d9;
@@ -185,6 +185,9 @@ def main() -> None:
     _render_header()
     st.markdown("---")
 
+    if "uploader_nonce" not in st.session_state:
+        st.session_state.uploader_nonce = 0
+
     with st.sidebar:
         st.header("⚙️ Configuración")
         source_labels = {
@@ -215,12 +218,14 @@ def main() -> None:
     )
     uploads = []
     zip_upload = None
+    uploader_nonce = st.session_state.uploader_nonce
     if input_mode == "Subir PDFs (explorador)":
         uploads = st.file_uploader(
             "📎 Arrastra una carpeta o selecciona múltiples PDFs",
             type=["pdf"],
             accept_multiple_files=True,
             help="Abre la carpeta local en el explorador y selecciona todos los PDFs.",
+            key=f"pdf_uploader_{uploader_nonce}",
         )
     else:
         zip_upload = st.file_uploader(
@@ -228,7 +233,12 @@ def main() -> None:
             type=["zip"],
             accept_multiple_files=False,
             help="Desde el explorador, comprime la carpeta en .zip y súbela aquí.",
+            key=f"zip_uploader_{uploader_nonce}",
         )
+
+    if st.button("🧹 Limpiar certificados cargados", use_container_width=True):
+        st.session_state.uploader_nonce += 1
+        st.rerun()
 
     run = st.button("✨ Procesar y descargar", type="primary", use_container_width=True)
     total_files = len(uploads or []) if input_mode == "Subir PDFs (explorador)" else 0
