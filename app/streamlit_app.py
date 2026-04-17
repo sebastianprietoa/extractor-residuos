@@ -150,13 +150,23 @@ def main() -> None:
 
     with st.sidebar:
         st.header("⚙️ Configuración")
-        source = st.selectbox(
-            "Tipo de extracción",
-            options=["SINADER", "SINDREP", "AMBOS", "AUTOCONTROL"],
-            index=2,
-        )
+        source_icons = {
+            "SINADER": "♻️",
+            "SINDREP": "🏭",
+            "AMBOS": "🧩",
+            "AUTOCONTROL": "🧪",
+        }
+        if "source_mode" not in st.session_state:
+            st.session_state.source_mode = "AMBOS"
+        st.caption("Selecciona función")
+        cols = st.columns(4)
+        for i, (mode, icon) in enumerate(source_icons.items()):
+            if cols[i].button(icon, key=f"btn_mode_{mode}", use_container_width=True):
+                st.session_state.source_mode = mode
+        source = st.session_state.source_mode
+        st.caption(f"Modo actual: {source}")
         if source == "AUTOCONTROL":
-            st.caption("Modo AUTOCONTROL: puedes subir PDFs o indicar ruta de carpeta del servidor.")
+            st.caption("AUTOCONTROL: selecciona una carpeta local y sube sus PDFs desde el explorador.")
         else:
             st.caption("Tip: para ambos tipos se descarga un ZIP con dos Excel.")
         branding_logo = _logo_source("logo_right.png", "GT_LOGO_RIGHT_URL", DEFAULT_RIGHT_LOGO_URL)
@@ -164,24 +174,12 @@ def main() -> None:
             st.image(branding_logo, use_container_width=True)
 
     st.markdown("<div class='box'>", unsafe_allow_html=True)
-    input_mode = "Subir PDFs"
-    folder_path_input = ""
-    if source == "AUTOCONTROL":
-        input_mode = st.radio("Modo de entrada", options=["Subir PDFs", "Ruta carpeta servidor"], horizontal=True)
-    uploads = []
-    if input_mode == "Subir PDFs":
-        uploads = st.file_uploader(
-            "📎 Arrastra una carpeta o selecciona múltiples PDFs",
-            type=["pdf"],
-            accept_multiple_files=True,
-            help="Puedes seleccionar múltiples PDFs. La app procesa todo en una sola ejecución.",
-        )
-    else:
-        folder_path_input = st.text_input(
-            "Ruta de carpeta en el servidor",
-            placeholder="/app/data/autocontrol",
-            help="Esta ruta debe existir en el servidor donde corre Streamlit.",
-        )
+    uploads = st.file_uploader(
+        "📎 Arrastra una carpeta o selecciona múltiples PDFs",
+        type=["pdf"],
+        accept_multiple_files=True,
+        help="En AUTOCONTROL abre el explorador, entra a la carpeta local y selecciona todos los PDFs.",
+    )
 
     run = st.button("✨ Procesar y descargar", type="primary", use_container_width=True)
     total_files = len(uploads or [])
@@ -199,26 +197,6 @@ def main() -> None:
     st.markdown("</div>", unsafe_allow_html=True)
 
     if not run:
-        return
-
-    if source == "AUTOCONTROL" and input_mode == "Ruta carpeta servidor":
-        folder_path = Path(folder_path_input.strip())
-        if not folder_path_input.strip() or not folder_path.exists() or not folder_path.is_dir():
-            st.warning("Debes indicar una carpeta válida del servidor.")
-            return
-        with st.spinner("Procesando AUTOCONTROL desde carpeta..."):
-            with tempfile.TemporaryDirectory(prefix="streamlit_autocontrol_") as temp_dir:
-                output = Path(temp_dir) / "autocontrol_output.xlsx"
-                process_autocontrol(str(folder_path), str(output))
-                data = output.read_bytes()
-        st.success("Proceso AUTOCONTROL completado.")
-        st.download_button(
-            label="Descargar Excel AUTOCONTROL",
-            data=data,
-            file_name="autocontrol_output.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
         return
 
     if not uploads:

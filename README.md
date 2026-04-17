@@ -68,7 +68,7 @@ En la barra lateral puedes elegir:
 - `SINADER`
 - `SINDREP`
 - `AMBOS`
-- `AUTOCONTROL` (acepta subida de PDFs o ruta de carpeta en servidor)
+- `AUTOCONTROL` (subida de PDFs desde carpeta local usando el explorador)
 
 ### Logos de empresa
 
