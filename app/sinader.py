@@ -52,6 +52,23 @@ DEFAULT_TREATMENT_DEFRA_MAP = {
     "anaerobic digestion": "Anaerobic digestion",
 }
 DEFAULT_TREATMENT_TRAINING_GLOB = "assets/*output*.xlsx"
+KNOWN_DESTINATIONS = [
+    "ECOPRIAL",
+    "ECOFIBRAS SUCURSAL PUERTO MONTT",
+    "PLASTICOS DEL SUR SPA",
+    "CONSORCIO COLLIPULLI",
+    "ESCOMBRERA TRESOL",
+    "CENTRO CRUCERO",
+    "PLANTA DE TRATAMIENTO DE AGUAS SERVIDAS DE CASTRO",
+    "RELLENO SANITARIO LOS ANGELES",
+    "PLANTA DE TRATAMIENTO DE RESIDUOS DOMICILIARIOS LAUTARO",
+]
+DESTINATION_NOISE_FRAGMENTS = [
+    "en otra categoría",
+    "planzas, boyas, flotadores, redes y cabos",
+    "cenizas del hogar",
+    "lodos del tratamiento",
+]
 
 
 def _strip_accents(s: str) -> str:
@@ -282,7 +299,20 @@ def _parse_reconstructed_row_block(
     block: str,
     known_treatments: Optional[List[str]] = None,
 ) -> Optional[Dict[str, str]]:
-    def _parse_tail_right_to_left(tail: str) -> Tuple[str, str, str, str, bool, bool]:
+    def _is_destination_clean(dst_text: str, desc_text: str) -> bool:
+        d = _norm(dst_text)
+        if not d:
+            return False
+        if any(_norm(x) in d for x in DESTINATION_NOISE_FRAGMENTS):
+            return False
+        dn = _norm(desc_text)
+        if dn:
+            for token in [t for t in dn.split() if len(t) >= 6]:
+                if token in d and token not in {"puerto", "tratamiento"}:
+                    return False
+        return True
+
+    def _parse_tail_right_to_left(tail: str, desc_text: str) -> Tuple[str, str, str, str, bool, bool]:
         text = _clean_cell(tail)
         if not text:
             return "", "", "", "", False, False
@@ -294,6 +324,14 @@ def _parse_reconstructed_row_block(
             text = _clean_cell(text[:m_pat.start()])
 
         chosen_treatment = ""
+        chosen_destination = ""
+        text_norm_full = _norm(text)
+        for dst in sorted(KNOWN_DESTINATIONS, key=lambda x: len(x), reverse=True):
+            if _norm(dst) in text_norm_full:
+                chosen_destination = dst
+                text = _clean_cell(re.sub(re.escape(dst), "", text, count=1, flags=re.IGNORECASE))
+                break
+
         if known_treatments:
             norm_text = _norm(text)
             for term in sorted(known_treatments, key=lambda x: len(x), reverse=True):
@@ -304,9 +342,9 @@ def _parse_reconstructed_row_block(
                     break
         text = re.sub(r"\b(destino|transportista|patente|cantidad|residuo|tipo tratamiento)\b", " ", text, flags=re.IGNORECASE)
         text = _clean_cell(re.sub(r"\s+", " ", text))
-        dst = text
+        dst = chosen_destination or text
         trt_ok = bool(chosen_treatment) and "cantidad residuo" not in _norm(chosen_treatment)
-        dst_ok = bool(dst) and "cantidad residuo tipo" not in _norm(dst)
+        dst_ok = _is_destination_clean(dst, desc_text)
         return chosen_treatment, dst, trp, pat, trt_ok, dst_ok
 
     block = _clean_cell(block)
@@ -338,7 +376,7 @@ def _parse_reconstructed_row_block(
     desc = _clean_cell(rest[:m_qty.start()])
     qty = _clean_cell(m_qty.group("qty"))
     tail = _clean_cell(rest[m_qty.end():])
-    trt_raw, dst_raw, trp_raw, pat_raw, trt_ok, dst_ok = _parse_tail_right_to_left(tail)
+    trt_raw, dst_raw, trp_raw, pat_raw, trt_ok, dst_ok = _parse_tail_right_to_left(tail, desc)
     trt, dst, trp, pat = _sanitize_treatment_and_logistics(
         trt_raw or tail,
         dst_raw,
@@ -346,8 +384,9 @@ def _parse_reconstructed_row_block(
         pat_raw,
         qty,
         known_treatments,
+        desc,
     )
-    parsing_ok = bool(code and desc and qty)
+    parsing_ok = bool(code and desc and qty and (trt_ok or dst_ok))
     return {
         "Código principal": code,
         "Descripción Residuo": desc,
@@ -446,6 +485,7 @@ def _sanitize_treatment_and_logistics(
     patente: str,
     cantidad: str = "",
     known_treatments: Optional[List[str]] = None,
+    descripcion: str = "",
 ) -> Tuple[str, str, str, str]:
     def _extract_treatment_phrase(text: str) -> str:
         if not text:
@@ -492,6 +532,19 @@ def _sanitize_treatment_and_logistics(
         def _is_placeholder_destination(value: str) -> bool:
             v = _norm(value)
             return (not v) or v.startswith("in situ") or v.startswith("situ de efluentes")
+
+        def _clean_destination_noise(value: str) -> str:
+            cleaned = _clean_cell(value)
+            for frag in DESTINATION_NOISE_FRAGMENTS:
+                cleaned = re.sub(re.escape(frag), " ", cleaned, flags=re.IGNORECASE)
+            if descripcion:
+                desc_norm = _norm(descripcion)
+                for token in [t for t in desc_norm.split() if len(t) >= 7]:
+                    if token in {"tratamiento", "residuos", "categoria", "especificadas"}:
+                        continue
+                    cleaned = re.sub(rf"\b{re.escape(token)}\b", " ", cleaned, flags=re.IGNORECASE)
+            cleaned = _clean_cell(re.sub(r"\s+", " ", cleaned))
+            return cleaned
 
         def _tail_after_qty_kg(text: str, qty_value: str) -> str:
             if not text:
@@ -566,7 +619,7 @@ def _sanitize_treatment_and_logistics(
             cleaned = re.sub(r"\d[\d\.,]*\s*kg\b", " ", cleaned, flags=re.IGNORECASE)
             cleaned = re.sub(r"\b(destino|transportista|patente)\b", " ", cleaned, flags=re.IGNORECASE)
             cleaned = re.sub(r"\bin\s*situ\s*de\s*efluentes\b", " ", cleaned, flags=re.IGNORECASE)
-            if not trp:
+            if not trp and not pat:
                 m_trp = re.search(r"\b(\d+)\|?\b", cleaned)
                 if m_trp:
                     trp = f"{m_trp.group(1)}|"
@@ -584,7 +637,7 @@ def _sanitize_treatment_and_logistics(
 
         if dst:
             dst = re.sub(r"\d+\|", " ", dst)
-            dst = _clean_cell(re.sub(r"\s+", " ", dst))
+            dst = _clean_destination_noise(_clean_cell(re.sub(r"\s+", " ", dst)))
 
     return trt, dst, trp, pat
 
@@ -640,6 +693,7 @@ def extract_sinader_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[
             r.get("Patente", ""),
             r.get("Cantidad (Kg)", ""),
             known_treatments,
+            r.get("Descripción Residuo", ""),
         )
         out_rows.append({
             "N.": str(i),
