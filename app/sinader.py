@@ -391,10 +391,16 @@ def parse_sinader_rows_from_text(full_text: str) -> List[Dict[str, str]]:
     return list(uniq.values())
 
 
-def extract_global_treatment_from_text(full_text: str) -> str:
+def extract_global_treatment_from_text(full_text: str, known_treatments: Optional[List[str]] = None) -> str:
     text = _cell_join_multiline(full_text or "")
     if not text:
         return ""
+    text_norm = _norm(text)
+    if known_treatments:
+        for term in sorted(known_treatments, key=lambda x: len(x), reverse=True):
+            term_norm = _norm(term)
+            if term_norm and term_norm in text_norm:
+                return term
     patterns = [
         r"(?:tipo\s*tratamiento|tratamiento)\s*[:\-]?\s*(reutilizaci[oó]n|reciclaje|combusti[oó]n|vertedero|anaerobic digestion)",
         r"(?:tipo\s*tratamiento|tratamiento)\s*[:\-]?\s*([A-Za-zÁÉÍÓÚÜÑáéíóúüñ\s]{4,60})",
@@ -411,11 +417,22 @@ def _sanitize_treatment_and_logistics(
     destino: str,
     transportista: str,
     patente: str,
+    known_treatments: Optional[List[str]] = None,
 ) -> Tuple[str, str, str, str]:
     def _extract_treatment_phrase(text: str) -> str:
         if not text:
             return ""
         text_norm = _norm(text)
+        if known_treatments:
+            for term in sorted(known_treatments, key=lambda x: len(x), reverse=True):
+                term_norm = _norm(term)
+                if not term_norm:
+                    continue
+                if term_norm in text_norm:
+                    return term
+                term_tokens = [t for t in term_norm.split() if len(t) > 3]
+                if term_tokens and all(t in text_norm for t in term_tokens):
+                    return term
         if "degradacion" in text_norm and "anaerobica" in text_norm:
             return "Degradación Anaeróbica"
         candidates = [
@@ -493,7 +510,8 @@ def extract_sinader_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[
             "Sin movimientos": "SI",
         }], meta
     detail_rows = parse_sinader_rows_from_tables(pdf_path) or parse_sinader_rows_from_text(full_text)
-    global_treatment = extract_global_treatment_from_text(full_text)
+    known_treatments = load_treatment_level3_terms()
+    global_treatment = extract_global_treatment_from_text(full_text, known_treatments)
     out_rows = []
     for i, r in enumerate(detail_rows, start=1):
         row_treatment = _clean_cell(r.get("Tratamiento", ""))
@@ -504,6 +522,7 @@ def extract_sinader_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[
             r.get("Destino", ""),
             r.get("Transportista", ""),
             r.get("Patente", ""),
+            known_treatments,
         )
         out_rows.append({
             "N.": str(i),
@@ -712,6 +731,40 @@ def load_treatment_defra_map(catalog_path: Optional[str] = None) -> Dict[str, st
         except Exception as exc:
             logger.warning("No se pudo cargar mapa de tratamientos SINADER en %s: %s", path, exc)
     return dict(DEFAULT_TREATMENT_DEFRA_MAP)
+
+
+def load_treatment_level3_terms(catalog_path: Optional[str] = None) -> List[str]:
+    configured_path = (catalog_path or os.getenv("SINADER_CATALOG_PATH", "")).strip()
+    candidate_paths = [Path(configured_path)] if configured_path else []
+    candidate_paths.append(DEFAULT_CATALOG_PATH)
+    for path in candidate_paths:
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            excel_file = pd.ExcelFile(path)
+            if TREATMENT_CATALOG_SHEET not in excel_file.sheet_names:
+                continue
+            df = pd.read_excel(path, sheet_name=TREATMENT_CATALOG_SHEET)
+            normalized_cols = {_norm(c): c for c in df.columns}
+            level3_col = None
+            for candidate in ["nivel 3", "nivel3", "level 3", "tratamiento", "treatment"]:
+                if candidate in normalized_cols:
+                    level3_col = normalized_cols[candidate]
+                    break
+            if not level3_col:
+                continue
+            values = []
+            for value in df[level3_col].dropna().tolist():
+                text = _clean_cell(value)
+                if text:
+                    values.append(text)
+            unique_values = sorted(set(values), key=lambda x: len(x), reverse=True)
+            if unique_values:
+                logger.info("Tratamientos Nivel 3 cargados desde %s (hoja=%s, filas=%s)", path, TREATMENT_CATALOG_SHEET, len(unique_values))
+                return unique_values
+        except Exception as exc:
+            logger.warning("No se pudo cargar tratamientos Nivel 3 desde %s: %s", path, exc)
+    return []
 
 
 def map_treatment_to_defra(tratamiento: str, treatment_map: Dict[str, str]) -> str:
