@@ -406,6 +406,44 @@ def extract_global_treatment_from_text(full_text: str) -> str:
     return ""
 
 
+def _sanitize_treatment_and_logistics(
+    tratamiento: str,
+    destino: str,
+    transportista: str,
+    patente: str,
+) -> Tuple[str, str, str, str]:
+    trt = _clean_cell(tratamiento)
+    dst = _clean_cell(destino)
+    trp = _clean_cell(transportista)
+    pat = _clean_cell(patente)
+
+    if trt:
+        trt = re.sub(r"^\d[\d\.,]*\s*(kg|kgs?)\s*", "", trt, flags=re.IGNORECASE).strip()
+        if _norm(trt) in {"destino transportista patente", "destino transportista", "transportista patente"}:
+            trt = ""
+        if "|" in trt and not dst:
+            left, right = [x.strip() for x in trt.split("|", 1)]
+            if right:
+                trt = left
+                dst = right
+
+        labeled = re.search(
+            r"(?:^|\s)destino\s*[:\-]?\s*(?P<dst>.*?)(?:\s+transportista\s*[:\-]?\s*(?P<trp>.*?))?(?:\s+patente\s*[:\-]?\s*(?P<pat>.*))?$",
+            trt,
+            flags=re.IGNORECASE,
+        )
+        if labeled:
+            if not dst:
+                dst = _clean_cell(labeled.group("dst") or "")
+            if not trp:
+                trp = _clean_cell(labeled.group("trp") or "")
+            if not pat:
+                pat = _clean_cell(labeled.group("pat") or "")
+            trt = ""
+
+    return trt, dst, trp, pat
+
+
 def extract_sinader_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[str, str]]:
     with pdfplumber.open(pdf_path) as pdf:
         full_text = "\n".join([(p.extract_text() or "") for p in pdf.pages])
@@ -432,6 +470,12 @@ def extract_sinader_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[
         row_treatment = _clean_cell(r.get("Tratamiento", ""))
         if not row_treatment and global_treatment:
             row_treatment = global_treatment
+        row_treatment, row_destino, row_transportista, row_patente = _sanitize_treatment_and_logistics(
+            row_treatment,
+            r.get("Destino", ""),
+            r.get("Transportista", ""),
+            r.get("Patente", ""),
+        )
         out_rows.append({
             "N.": str(i),
             "Descripción Residuo": r.get("Descripción Residuo", ""),
@@ -441,9 +485,9 @@ def extract_sinader_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[
             "Estado contenedor": r.get("Estado contenedor", ""),
             "Contenedor": r.get("Contenedor", ""),
             "Tratamiento": row_treatment,
-            "Destino": r.get("Destino", ""),
-            "Transportista": r.get("Transportista", ""),
-            "Patente": r.get("Patente", ""),
+            "Destino": row_destino,
+            "Transportista": row_transportista,
+            "Patente": row_patente,
             "Sin movimientos": "NO",
         })
     return out_rows, meta
