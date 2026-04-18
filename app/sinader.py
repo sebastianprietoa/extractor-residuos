@@ -303,7 +303,7 @@ def parse_sinader_rows_from_tables(pdf_path: str) -> List[Dict[str, str]]:
 
                 c_res = find_col("residuo")
                 c_qty = find_col("cantidad")
-                c_trt = find_col("tratamiento", "tipo tratamiento", "tipo")
+                c_trt = find_col("tratamiento", "tipo tratamiento", "tipo", "tipo anotado", "tipo anotado expandido")
                 c_dst = find_col("destino")
                 c_trp = find_col("transportista")
                 c_pat = find_col("patente")
@@ -346,23 +346,40 @@ def parse_sinader_rows_from_text(full_text: str) -> List[Dict[str, str]]:
     text_flat = full_text.replace("\r", "\n").replace("\u00a0", " ")
     text_flat = re.sub(r"\n+", "\n", text_flat)
     pattern = re.compile(
-        r"(?P<codigo>\d{2}\s\d{2}\s\d{2})\s*\|\s*(?P<desc>.*?)\s+(?P<cantidad>\d[\d\.,]*)\s*kg\b",
+        r"(?P<codigo>\d{2}\s\d{2}\s\d{2})\s*\|\s*(?P<body>.*?)(?=(\d{2}\s\d{2}\s\d{2}\s*\|)|\Z)",
         flags=re.IGNORECASE | re.DOTALL,
     )
+
+    def _extract_labeled_value(block: str, labels: List[str]) -> str:
+        joined_labels = "|".join(re.escape(lbl) for lbl in labels)
+        next_labels = r"(tipo\s*tratamiento|tratamiento|destino|transportista|patente|cantidad|$)"
+        m = re.search(
+            rf"(?:{joined_labels})\s*:\s*(.+?)(?=\s*(?:{next_labels})\s*:|\s*$)",
+            block,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        return _clean_cell(_cell_join_multiline(m.group(1))) if m else ""
+
+    def _extract_qty(block: str) -> str:
+        m = re.search(r"(\d[\d\.,]*)\s*kg\b", block, flags=re.IGNORECASE)
+        return _clean_cell(m.group(1)) if m else ""
+
     for m in pattern.finditer(text_flat):
-        desc = _cell_join_multiline(m.group("desc"))
+        body = _cell_join_multiline(m.group("body"))
+        qty = _extract_qty(body)
+        desc = re.sub(r"\b\d[\d\.,]*\s*kg\b.*$", "", body, flags=re.IGNORECASE).strip()
         desc = re.sub(r"^(Residuo\s+)?", "", desc, flags=re.IGNORECASE).strip()
-        desc = re.sub(r"\b(Tipo Tratamiento|Destino|Transportista|Patente)\b.*$", "", desc, flags=re.IGNORECASE).strip()
+        desc = re.sub(r"\b(Tipo Tratamiento|Tratamiento|Destino|Transportista|Patente)\b.*$", "", desc, flags=re.IGNORECASE).strip()
         if not desc:
             continue
         rows_out.append({
             "Código principal": _clean_cell(m.group("codigo")),
             "Descripción Residuo": desc,
-            "Cantidad (Kg)": _clean_cell(m.group("cantidad")),
-            "Tratamiento": "",
-            "Destino": "",
-            "Transportista": "",
-            "Patente": "",
+            "Cantidad (Kg)": qty,
+            "Tratamiento": _extract_labeled_value(body, ["Tipo Tratamiento", "Tratamiento"]),
+            "Destino": _extract_labeled_value(body, ["Destino"]),
+            "Transportista": _extract_labeled_value(body, ["Transportista"]),
+            "Patente": _extract_labeled_value(body, ["Patente"]),
             "Peligrosidad": "",
             "Estado contenedor": "",
             "Contenedor": "",
