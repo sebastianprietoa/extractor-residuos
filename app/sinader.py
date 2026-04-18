@@ -241,48 +241,94 @@ def _split_code_and_desc(residuo_cell: str) -> Tuple[str, str]:
     return "", s
 
 
+def _extract_table_text_block(full_text: str) -> str:
+    text = full_text.replace("\r", "\n").replace("\u00a0", " ")
+    start_match = re.search(r"Residuo.*Cantidad.*Destino", text, flags=re.IGNORECASE | re.DOTALL)
+    if not start_match:
+        return text
+    block = text[start_match.start():]
+    end_match = re.search(r"La\s+integridad\s+y\s+veracidad", block, flags=re.IGNORECASE)
+    if end_match:
+        block = block[:end_match.start()]
+    return block
+
+
+def _reconstruct_row_blocks_from_lines(lines: List[str]) -> List[str]:
+    blocks: List[str] = []
+    current: List[str] = []
+    ler_start = re.compile(r"^\s*\d{2}\s+\d{2}\s+\d{2}\s*\|")
+    for ln in lines:
+        line = _clean_cell(ln)
+        if not line:
+            continue
+        if ler_start.match(line):
+            if current:
+                blocks.append(_clean_cell(" ".join(current)))
+            current = [line]
+        else:
+            if current:
+                current.append(line)
+    if current:
+        blocks.append(_clean_cell(" ".join(current)))
+    return blocks
+
+
+def _parse_reconstructed_row_block(
+    block: str,
+    known_treatments: Optional[List[str]] = None,
+) -> Optional[Dict[str, str]]:
+    block = _clean_cell(block)
+    if not block:
+        return None
+    m_code = re.match(r"^\s*(\d{2}\s+\d{2}\s+\d{2})\s*\|\s*(.*)$", block)
+    if not m_code:
+        return None
+    code = _clean_cell(m_code.group(1))
+    rest = _clean_cell(m_code.group(2))
+    m_qty = re.search(r"(?P<qty>\d[\d\.,]*)\s*kg\b", rest, flags=re.IGNORECASE)
+    if not m_qty:
+        return {
+            "Código principal": code,
+            "Descripción Residuo": rest,
+            "Cantidad (Kg)": "",
+            "Tratamiento": "",
+            "Destino": "",
+            "Transportista": "",
+            "Patente": "",
+            "Peligrosidad": "",
+            "Estado contenedor": "",
+            "Contenedor": "",
+            "Texto fila original": block,
+        }
+    desc = _clean_cell(rest[:m_qty.start()])
+    qty = _clean_cell(m_qty.group("qty"))
+    tail = _clean_cell(rest[m_qty.end():])
+    trt, dst, trp, pat = _sanitize_treatment_and_logistics(
+        tail,
+        "",
+        "",
+        "",
+        qty,
+        known_treatments,
+    )
+    return {
+        "Código principal": code,
+        "Descripción Residuo": desc,
+        "Cantidad (Kg)": qty,
+        "Tratamiento": trt,
+        "Destino": dst,
+        "Transportista": trp,
+        "Patente": pat,
+        "Peligrosidad": "",
+        "Estado contenedor": "",
+        "Contenedor": "",
+        "Texto fila original": block,
+    }
+
+
 def parse_sinader_rows_from_tables(pdf_path: str) -> List[Dict[str, str]]:
     rows_out: List[Dict[str, str]] = []
-
-    def _merge_continuations(tb_rows, idx_res, idx_qty, idx_trt, idx_dst, idx_trp, idx_pat):
-        merged = []
-        for r in tb_rows:
-            r = list(r) if r else []
-            max_idx = max([i for i in [idx_res, idx_qty, idx_trt, idx_dst, idx_trp, idx_pat] if i is not None] + [0])
-            if len(r) <= max_idx:
-                r += [""] * (max_idx + 1 - len(r))
-            if not merged:
-                merged.append(r)
-                continue
-            res_val = _clean_cell(r[idx_res]) if idx_res is not None else ""
-            qty_val = _clean_cell(r[idx_qty]) if idx_qty is not None else ""
-            trt_val = _clean_cell(r[idx_trt]) if idx_trt is not None else ""
-            dst_val = _clean_cell(r[idx_dst]) if idx_dst is not None else ""
-            trp_val = _clean_cell(r[idx_trp]) if idx_trp is not None else ""
-            pat_val = _clean_cell(r[idx_pat]) if idx_pat is not None else ""
-            looks_like_continuation = (qty_val == "") and any([res_val, trt_val, dst_val, trp_val, pat_val])
-            if looks_like_continuation:
-                prev = merged[-1]
-                if len(prev) <= max_idx:
-                    prev += [""] * (max_idx + 1 - len(prev))
-                    merged[-1] = prev
-                def append_col(i: int, new_text: str):
-                    if new_text:
-                        old = _clean_cell(prev[i])
-                        prev[i] = (old + " " + new_text).strip() if old else new_text
-                append_col(idx_res, res_val)
-                if idx_trt is not None:
-                    append_col(idx_trt, trt_val)
-                if idx_dst is not None:
-                    append_col(idx_dst, dst_val)
-                if idx_trp is not None:
-                    append_col(idx_trp, trp_val)
-                if idx_pat is not None:
-                    append_col(idx_pat, pat_val)
-                continue
-            merged.append(r)
-        return merged
-
+    known_treatments = load_treatment_level3_terms()
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
             try:
@@ -292,48 +338,20 @@ def parse_sinader_rows_from_tables(pdf_path: str) -> List[Dict[str, str]]:
             for tb in tables:
                 if not tb or not tb[0]:
                     continue
-                header = [_norm(_clean_cell(c)) for c in tb[0]]
-                header_join = " ".join(header)
-                if not (("residuo" in header_join) and ("cantidad" in header_join) and ("destino" in header_join)):
+                if not _looks_like_sinader_table(tb):
                     continue
-
-                def find_col(*needles: str) -> Optional[int]:
-                    for i, h in enumerate(header):
-                        if any(n in h for n in needles):
-                            return i
-                    return None
-
-                c_res = find_col("residuo")
-                c_qty = find_col("cantidad")
-                c_trt = find_col("tratamiento", "tratam", "tipo tratamiento", "tipo", "tipo anotado", "tipo anotado expandido")
-                c_dst = find_col("destino", "destin")
-                c_trp = find_col("transportista", "transpor")
-                c_pat = find_col("patente")
-                if c_res is None or c_qty is None:
-                    continue
-                body_merged = _merge_continuations(tb[1:], c_res, c_qty, c_trt, c_dst, c_trp, c_pat)
-                for r in body_merged:
-                    def g(i):
-                        if i is None or i >= len(r):
-                            return ""
-                        return _cell_join_multiline(r[i])
-                    residuo_cell = g(c_res)
-                    qty_cell = g(c_qty)
-                    if _clean_cell(residuo_cell) == "" and _clean_cell(qty_cell) == "":
+                raw_lines: List[str] = []
+                for r in tb[1:]:
+                    cells = [_clean_cell(c) for c in (r or []) if _clean_cell(c)]
+                    if not cells:
                         continue
-                    cod, desc = _split_code_and_desc(residuo_cell)
-                    rows_out.append({
-                        "Código principal": cod,
-                        "Descripción Residuo": desc,
-                        "Cantidad (Kg)": qty_cell,
-                        "Tratamiento": g(c_trt),
-                        "Destino": g(c_dst),
-                        "Transportista": g(c_trp),
-                        "Patente": g(c_pat),
-                        "Peligrosidad": "",
-                        "Estado contenedor": "",
-                        "Contenedor": "",
-                    })
+                    raw_lines.append(" | ".join(cells))
+                blocks = _reconstruct_row_blocks_from_lines(raw_lines)
+                for block in blocks:
+                    parsed = _parse_reconstructed_row_block(block, known_treatments)
+                    if not parsed:
+                        continue
+                    rows_out.append(parsed)
     uniq = {}
     for r in rows_out:
         key = (r.get("Código principal", ""), _norm(r.get("Descripción Residuo", "")), _clean_cell(r.get("Cantidad (Kg)", "")))
@@ -342,50 +360,17 @@ def parse_sinader_rows_from_tables(pdf_path: str) -> List[Dict[str, str]]:
 
 
 def parse_sinader_rows_from_text(full_text: str) -> List[Dict[str, str]]:
-    rows_out = []
+    rows_out: List[Dict[str, str]] = []
     if not full_text:
         return rows_out
-    text_flat = full_text.replace("\r", "\n").replace("\u00a0", " ")
-    text_flat = re.sub(r"\n+", "\n", text_flat)
-    pattern = re.compile(
-        r"(?P<codigo>\d{2}\s\d{2}\s\d{2})\s*\|\s*(?P<body>.*?)(?=(\d{2}\s\d{2}\s\d{2}\s*\|)|\Z)",
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-
-    def _extract_labeled_value(block: str, labels: List[str]) -> str:
-        joined_labels = "|".join(re.escape(lbl) for lbl in labels)
-        next_labels = r"(tipo\s*tratamiento|tratamiento|destino|transportista|patente|cantidad|$)"
-        m = re.search(
-            rf"(?:{joined_labels})\s*[:\-]?\s*(.+?)(?=\s*(?:{next_labels})\s*[:\-]?|\s*$)",
-            block,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        return _clean_cell(_cell_join_multiline(m.group(1))) if m else ""
-
-    def _extract_qty(block: str) -> str:
-        m = re.search(r"(\d[\d\.,]*)\s*kg\b", block, flags=re.IGNORECASE)
-        return _clean_cell(m.group(1)) if m else ""
-
-    for m in pattern.finditer(text_flat):
-        body = _cell_join_multiline(m.group("body"))
-        qty = _extract_qty(body)
-        desc = re.sub(r"\b\d[\d\.,]*\s*kg\b.*$", "", body, flags=re.IGNORECASE).strip()
-        desc = re.sub(r"^(Residuo\s+)?", "", desc, flags=re.IGNORECASE).strip()
-        desc = re.sub(r"\b(Tipo Tratamiento|Tratamiento|Destino|Transportista|Patente)\b.*$", "", desc, flags=re.IGNORECASE).strip()
-        if not desc:
-            continue
-        rows_out.append({
-            "Código principal": _clean_cell(m.group("codigo")),
-            "Descripción Residuo": desc,
-            "Cantidad (Kg)": qty,
-            "Tratamiento": _extract_labeled_value(body, ["Tipo Tratamiento", "Tratamiento"]),
-            "Destino": _extract_labeled_value(body, ["Destino"]),
-            "Transportista": _extract_labeled_value(body, ["Transportista"]),
-            "Patente": _extract_labeled_value(body, ["Patente"]),
-            "Peligrosidad": "",
-            "Estado contenedor": "",
-            "Contenedor": "",
-        })
+    known_treatments = load_treatment_level3_terms()
+    block_text = _extract_table_text_block(full_text)
+    lines = [_clean_cell(x) for x in block_text.splitlines() if _clean_cell(x)]
+    blocks = _reconstruct_row_blocks_from_lines(lines)
+    for block in blocks:
+        parsed = _parse_reconstructed_row_block(block, known_treatments)
+        if parsed:
+            rows_out.append(parsed)
     uniq = {}
     for r in rows_out:
         key = (r.get("Código principal", ""), _norm(r.get("Descripción Residuo", "")), _clean_cell(r.get("Cantidad (Kg)", "")))
@@ -583,7 +568,20 @@ def extract_sinader_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[
             "Patente": "",
             "Sin movimientos": "SI",
         }], meta
-    detail_rows = parse_sinader_rows_from_tables(pdf_path) or parse_sinader_rows_from_text(full_text)
+    rows_from_tables = parse_sinader_rows_from_tables(pdf_path)
+    rows_from_text = parse_sinader_rows_from_text(full_text)
+
+    def _score_rows(rows: List[Dict[str, str]]) -> tuple[int, int, int]:
+        valid_core = sum(1 for r in rows if _clean_cell(r.get("Código principal", "")) and _clean_cell(r.get("Cantidad (Kg)", "")))
+        with_treatment = sum(1 for r in rows if _clean_cell(r.get("Tratamiento", "")))
+        return (valid_core, with_treatment, len(rows))
+
+    detail_rows = rows_from_tables
+    if not rows_from_tables and rows_from_text:
+        detail_rows = rows_from_text
+    elif rows_from_tables and rows_from_text:
+        detail_rows = rows_from_text if _score_rows(rows_from_text) > _score_rows(rows_from_tables) else rows_from_tables
+
     known_treatments = load_treatment_level3_terms()
     global_treatment = extract_global_treatment_from_text(full_text, known_treatments)
     out_rows = []
@@ -1089,3 +1087,20 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
     df.to_excel(output_excel, index=False)
     logger.info("Excel generado: %s | filas=%s", output_excel, len(df))
     return df
+
+
+def _selfcheck_reconstruction_samples() -> Dict[str, bool]:
+    sample_lines = [
+        "02 02 04 | Lodos del tratamiento in",
+        "situ de efluentes 26450 kg Degradación",
+        "Anaeróbica ECOPRIAL 1|",
+        "20 01 99 | Otras fracciones no especificadas en otra categoría 4210 kg Relleno sanitario CONSORCIO COLLIPULLI 1|",
+    ]
+    blocks = _reconstruct_row_blocks_from_lines(sample_lines)
+    parsed = [_parse_reconstructed_row_block(b, ["Degradación Anaeróbica", "Relleno sanitario"]) for b in blocks]
+    parsed = [p for p in parsed if p]
+    return {
+        "multiline_row_reconstructed": len(parsed) >= 2 and parsed[0]["Código principal"] == "02 02 04",
+        "code_desc_qty_split": bool(parsed and parsed[0]["Descripción Residuo"] and parsed[0]["Cantidad (Kg)"]),
+        "cross_page_like_continuity": len(blocks) == 2,
+    }
