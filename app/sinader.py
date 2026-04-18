@@ -257,9 +257,14 @@ def _reconstruct_row_blocks_from_lines(lines: List[str]) -> List[str]:
     blocks: List[str] = []
     current: List[str] = []
     ler_start = re.compile(r"^\s*\d{2}\s+\d{2}\s+\d{2}\s*\|")
+    header_noise = re.compile(r"^\s*(residuo|cantidad|tipo\s*tratamiento|tratamiento|destino|transportista|patente)\b", flags=re.IGNORECASE)
     for ln in lines:
         line = _clean_cell(ln)
         if not line:
+            continue
+        if header_noise.search(line) and "|" not in line and not ler_start.match(line):
+            continue
+        if "cantidad residuo tipo tratamiento destino" in _norm(line):
             continue
         if ler_start.match(line):
             if current:
@@ -277,6 +282,33 @@ def _parse_reconstructed_row_block(
     block: str,
     known_treatments: Optional[List[str]] = None,
 ) -> Optional[Dict[str, str]]:
+    def _parse_tail_right_to_left(tail: str) -> Tuple[str, str, str, str, bool, bool]:
+        text = _clean_cell(tail)
+        if not text:
+            return "", "", "", "", False, False
+        pat = ""
+        trp = ""
+        m_pat = re.search(r"(\d+\|)\s*$", text)
+        if m_pat:
+            pat = _clean_cell(m_pat.group(1))
+            text = _clean_cell(text[:m_pat.start()])
+
+        chosen_treatment = ""
+        if known_treatments:
+            norm_text = _norm(text)
+            for term in sorted(known_treatments, key=lambda x: len(x), reverse=True):
+                tnorm = _norm(term)
+                if tnorm and tnorm in norm_text:
+                    chosen_treatment = term
+                    text = _clean_cell(re.sub(re.escape(term), "", text, count=1, flags=re.IGNORECASE))
+                    break
+        text = re.sub(r"\b(destino|transportista|patente|cantidad|residuo|tipo tratamiento)\b", " ", text, flags=re.IGNORECASE)
+        text = _clean_cell(re.sub(r"\s+", " ", text))
+        dst = text
+        trt_ok = bool(chosen_treatment) and "cantidad residuo" not in _norm(chosen_treatment)
+        dst_ok = bool(dst) and "cantidad residuo tipo" not in _norm(dst)
+        return chosen_treatment, dst, trp, pat, trt_ok, dst_ok
+
     block = _clean_cell(block)
     if not block:
         return None
@@ -299,18 +331,23 @@ def _parse_reconstructed_row_block(
             "Estado contenedor": "",
             "Contenedor": "",
             "Texto fila original": block,
+            "Parsing_OK": "NO",
+            "Tratamiento_confiable": "NO",
+            "Destino_confiable": "NO",
         }
     desc = _clean_cell(rest[:m_qty.start()])
     qty = _clean_cell(m_qty.group("qty"))
     tail = _clean_cell(rest[m_qty.end():])
+    trt_raw, dst_raw, trp_raw, pat_raw, trt_ok, dst_ok = _parse_tail_right_to_left(tail)
     trt, dst, trp, pat = _sanitize_treatment_and_logistics(
-        tail,
-        "",
-        "",
-        "",
+        trt_raw or tail,
+        dst_raw,
+        trp_raw,
+        pat_raw,
         qty,
         known_treatments,
     )
+    parsing_ok = bool(code and desc and qty)
     return {
         "Código principal": code,
         "Descripción Residuo": desc,
@@ -323,6 +360,9 @@ def _parse_reconstructed_row_block(
         "Estado contenedor": "",
         "Contenedor": "",
         "Texto fila original": block,
+        "Parsing_OK": "SI" if parsing_ok else "NO",
+        "Tratamiento_confiable": "SI" if trt_ok and bool(trt) else "NO",
+        "Destino_confiable": "SI" if dst_ok and bool(dst) else "NO",
     }
 
 
@@ -567,6 +607,10 @@ def extract_sinader_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[
             "Transportista": "",
             "Patente": "",
             "Sin movimientos": "SI",
+            "Texto fila original": "",
+            "Parsing_OK": "SI",
+            "Tratamiento_confiable": "NO",
+            "Destino_confiable": "NO",
         }], meta
     rows_from_tables = parse_sinader_rows_from_tables(pdf_path)
     rows_from_text = parse_sinader_rows_from_text(full_text)
@@ -610,6 +654,10 @@ def extract_sinader_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[
             "Transportista": row_transportista,
             "Patente": row_patente,
             "Sin movimientos": "NO",
+            "Texto fila original": r.get("Texto fila original", ""),
+            "Parsing_OK": r.get("Parsing_OK", "NO"),
+            "Tratamiento_confiable": r.get("Tratamiento_confiable", "NO"),
+            "Destino_confiable": r.get("Destino_confiable", "NO"),
         })
     return out_rows, meta
 
@@ -1049,7 +1097,7 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
         "RUT Titular", "Realizado por", "Tipo", "Estado", "Código identificador", "Región", "Comuna",
         "Sin movimientos", "N.", "Descripción Residuo", "Descripción Residuo Original", "Código principal",
         "Peligrosidad", "Cantidad (Kg)", "Tratamiento", "Destino", "Transportista", "Patente",
-        "Contenedor", "Estado contenedor", "DEFRA",
+        "Contenedor", "Estado contenedor", "Texto fila original", "Parsing_OK", "Tratamiento_confiable", "Destino_confiable", "DEFRA_base", "DEFRA",
     ]
     cols = [c for c in preferred_cols if c in df.columns] + [c for c in df.columns if c not in preferred_cols]
     df = df[cols] if not df.empty else pd.DataFrame(columns=preferred_cols)
@@ -1068,19 +1116,39 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
     treatment_defra_map = load_treatment_defra_map()
     if "DEFRA" not in df.columns:
         df["DEFRA"] = ""
-    df["DEFRA"] = df.apply(
+    df["DEFRA_base"] = df.apply(
         lambda r: defra_classification(
             desc_residuo=r.get("Descripción Residuo", ""),
             sin_movimientos=r.get("Sin movimientos", ""),
             codigo_principal=r.get("Código principal", ""),
-            tratamiento=r.get("Tratamiento", ""),
-            destino=r.get("Destino", ""),
+            tratamiento="",
+            destino="",
         ),
         axis=1,
     )
+    df["DEFRA"] = df["DEFRA_base"]
     if "Tratamiento" in df.columns:
+        def _treatment_is_reliable(row) -> bool:
+            t = _norm(_clean_cell(row.get("Tratamiento", "")))
+            txt = _norm(_clean_cell(row.get("Texto fila original", "")))
+            flag = _norm(_clean_cell(row.get("Tratamiento_confiable", "no")))
+            if flag not in {"si", "yes", "true"}:
+                return False
+            if not t:
+                return False
+            bad_tokens = ["cantidad residuo", "tipo tratamiento destino", "transportista patente", "destino transportista"]
+            if any(b in t for b in bad_tokens):
+                return False
+            if any(b in txt for b in bad_tokens):
+                return False
+            return True
+
         df["DEFRA"] = df.apply(
-            lambda r: map_treatment_to_defra(r.get("Tratamiento", ""), treatment_defra_map) or r.get("DEFRA", ""),
+            lambda r: (
+                map_treatment_to_defra(r.get("Tratamiento", ""), treatment_defra_map)
+                if _treatment_is_reliable(r)
+                else ""
+            ) or r.get("DEFRA_base", ""),
             axis=1,
         )
     Path(output_excel).parent.mkdir(parents=True, exist_ok=True)
@@ -1091,16 +1159,38 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
 
 def _selfcheck_reconstruction_samples() -> Dict[str, bool]:
     sample_lines = [
+        "Residuo Cantidad (kg) Tipo Tratamiento Destino Transportista Patente",
         "02 02 04 | Lodos del tratamiento in",
         "situ de efluentes 26450 kg Degradación",
         "Anaeróbica ECOPRIAL 1|",
+        "19 08 05 | Lodos del tratamiento de aguas residuales urbanas 84180 kg Recepción de Lodos en PTAS PLANTA DE TRATAMIENTO DE AGUAS SERVIDAS DE CASTRO 1|",
+        "15 01 01 | Envases de papel y cartón 165 kg Reciclaje de papel, cartón y productos de papel ECOFIBRAS SUCURSAL PUERTO MONTT 1|",
+        "10 01 01 | Cenizas del hogar 4260 kg Sitio de Escombros de la Construcción ESCOMBRERA TRESOL 1|",
         "20 01 99 | Otras fracciones no especificadas en otra categoría 4210 kg Relleno sanitario CONSORCIO COLLIPULLI 1|",
     ]
     blocks = _reconstruct_row_blocks_from_lines(sample_lines)
-    parsed = [_parse_reconstructed_row_block(b, ["Degradación Anaeróbica", "Relleno sanitario"]) for b in blocks]
+    parsed = [_parse_reconstructed_row_block(b, [
+        "Degradación Anaeróbica",
+        "Relleno sanitario",
+        "Sitio de Escombros de la Construcción",
+        "Reciclaje de papel, cartón y productos de papel",
+        "Recepción de Lodos en PTAS",
+    ]) for b in blocks]
     parsed = [p for p in parsed if p]
+    p_by_code = {p["Código principal"]: p for p in parsed}
     return {
-        "multiline_row_reconstructed": len(parsed) >= 2 and parsed[0]["Código principal"] == "02 02 04",
+        "multiline_row_reconstructed": len(parsed) >= 5 and p_by_code.get("02 02 04", {}).get("Tratamiento") == "Degradación Anaeróbica",
         "code_desc_qty_split": bool(parsed and parsed[0]["Descripción Residuo"] and parsed[0]["Cantidad (Kg)"]),
-        "cross_page_like_continuity": len(blocks) == 2,
+        "cross_page_like_continuity": len(blocks) >= 5,
+        "header_line_filtered": all("residuo cantidad" not in _norm(p.get("Texto fila original", "")) for p in parsed),
+        "known_cases_treatment_destination": (
+            p_by_code.get("19 08 05", {}).get("Tratamiento") == "Recepción de Lodos en PTAS"
+            and "PLANTA DE TRATAMIENTO" in p_by_code.get("19 08 05", {}).get("Destino", "")
+            and p_by_code.get("15 01 01", {}).get("Tratamiento") == "Reciclaje de papel, cartón y productos de papel"
+            and "ECOFIBRAS SUCURSAL PUERTO MONTT" in p_by_code.get("15 01 01", {}).get("Destino", "")
+            and p_by_code.get("10 01 01", {}).get("Tratamiento") == "Sitio de Escombros de la Construcción"
+            and "ESCOMBRERA TRESOL" in p_by_code.get("10 01 01", {}).get("Destino", "")
+            and p_by_code.get("20 01 99", {}).get("Tratamiento") == "Relleno sanitario"
+            and "CONSORCIO COLLIPULLI" in p_by_code.get("20 01 99", {}).get("Destino", "")
+        ),
     }
