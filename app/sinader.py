@@ -412,6 +412,31 @@ def _sanitize_treatment_and_logistics(
     transportista: str,
     patente: str,
 ) -> Tuple[str, str, str, str]:
+    def _extract_treatment_phrase(text: str) -> str:
+        if not text:
+            return ""
+        text_norm = _norm(text)
+        if "degradacion" in text_norm and "anaerobica" in text_norm:
+            return "Degradación Anaeróbica"
+        candidates = [
+            r"relleno\s+sanitario",
+            r"sitio\s+de\s+escombros\s+de\s+la\s+construcci[oó]n",
+            r"reciclaje\s+de\s+pl[aá]sticos",
+            r"reciclaje\s+de\s+metales",
+            r"reciclaje\s+de\s+papel(?:,\s*cart[oó]n\s*y\s*productos\s*de\s*papel)?",
+            r"monorelleno",
+            r"compostaje",
+            r"reutilizaci[oó]n",
+            r"combusti[oó]n",
+            r"anaerobic\s+digestion",
+            r"reciclaje",
+        ]
+        for pat in candidates:
+            m = re.search(pat, text, flags=re.IGNORECASE)
+            if m:
+                return _clean_cell(m.group(0))
+        return ""
+
     trt = _clean_cell(tratamiento)
     dst = _clean_cell(destino)
     trp = _clean_cell(transportista)
@@ -440,6 +465,10 @@ def _sanitize_treatment_and_logistics(
             if not pat:
                 pat = _clean_cell(labeled.group("pat") or "")
             trt = ""
+
+        phrase = _extract_treatment_phrase(trt)
+        if phrase:
+            trt = phrase
 
     return trt, dst, trp, pat
 
