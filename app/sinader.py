@@ -1,6 +1,7 @@
 import re
 import unicodedata
 import logging
+import os
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from difflib import SequenceMatcher
@@ -39,6 +40,17 @@ MASTER_RESIDUOS: Dict[str, List[str]] = {
     "21 04 04": ["Residuos de plásticos (HDPE, PEE, PETE, PVC) excepto planzas, boyas, flotadores, redes y cabos."],
 }
 
+DEFAULT_CATALOG_PATH = Path("assets/sinader_codigos.xlsx")
+PREFERRED_CATALOG_SHEETS = ("LER_completo_842",)
+TREATMENT_CATALOG_SHEET = "Tratamiento_SINADER"
+DEFAULT_TREATMENT_DEFRA_MAP = {
+    "reutilizacion": "Re-use",
+    "reciclaje": "Open-loop",
+    "combustion": "Combustion",
+    "vertedero": "Landfill",
+    "anaerobic digestion": "Anaerobic digestion",
+}
+
 
 def _strip_accents(s: str) -> str:
     if s is None:
@@ -59,6 +71,18 @@ def _clean_cell(s: Optional[str]) -> str:
     s = str(s).replace("\u00a0", " ")
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+
+def _normalize_code(code: Optional[str]) -> str:
+    raw = _clean_cell(code)
+    if not raw:
+        return ""
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 6:
+        return f"{digits[0:2]} {digits[2:4]} {digits[4:6]}"
+    if len(digits) > 6:
+        return f"{digits[0:2]} {digits[2:4]} {digits[4:6]}"
+    return raw
 
 
 def _cell_join_multiline(x: Optional[str]) -> str:
@@ -279,9 +303,9 @@ def parse_sinader_rows_from_tables(pdf_path: str) -> List[Dict[str, str]]:
 
                 c_res = find_col("residuo")
                 c_qty = find_col("cantidad")
-                c_trt = find_col("tratamiento", "tipo tratamiento", "tipo")
-                c_dst = find_col("destino")
-                c_trp = find_col("transportista")
+                c_trt = find_col("tratamiento", "tratam", "tipo tratamiento", "tipo", "tipo anotado", "tipo anotado expandido")
+                c_dst = find_col("destino", "destin")
+                c_trp = find_col("transportista", "transpor")
                 c_pat = find_col("patente")
                 if c_res is None or c_qty is None:
                     continue
@@ -322,23 +346,40 @@ def parse_sinader_rows_from_text(full_text: str) -> List[Dict[str, str]]:
     text_flat = full_text.replace("\r", "\n").replace("\u00a0", " ")
     text_flat = re.sub(r"\n+", "\n", text_flat)
     pattern = re.compile(
-        r"(?P<codigo>\d{2}\s\d{2}\s\d{2})\s*\|\s*(?P<desc>.*?)\s+(?P<cantidad>\d[\d\.,]*)\s*kg\b",
+        r"(?P<codigo>\d{2}\s\d{2}\s\d{2})\s*\|\s*(?P<body>.*?)(?=(\d{2}\s\d{2}\s\d{2}\s*\|)|\Z)",
         flags=re.IGNORECASE | re.DOTALL,
     )
+
+    def _extract_labeled_value(block: str, labels: List[str]) -> str:
+        joined_labels = "|".join(re.escape(lbl) for lbl in labels)
+        next_labels = r"(tipo\s*tratamiento|tratamiento|destino|transportista|patente|cantidad|$)"
+        m = re.search(
+            rf"(?:{joined_labels})\s*[:\-]?\s*(.+?)(?=\s*(?:{next_labels})\s*[:\-]?|\s*$)",
+            block,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        return _clean_cell(_cell_join_multiline(m.group(1))) if m else ""
+
+    def _extract_qty(block: str) -> str:
+        m = re.search(r"(\d[\d\.,]*)\s*kg\b", block, flags=re.IGNORECASE)
+        return _clean_cell(m.group(1)) if m else ""
+
     for m in pattern.finditer(text_flat):
-        desc = _cell_join_multiline(m.group("desc"))
+        body = _cell_join_multiline(m.group("body"))
+        qty = _extract_qty(body)
+        desc = re.sub(r"\b\d[\d\.,]*\s*kg\b.*$", "", body, flags=re.IGNORECASE).strip()
         desc = re.sub(r"^(Residuo\s+)?", "", desc, flags=re.IGNORECASE).strip()
-        desc = re.sub(r"\b(Tipo Tratamiento|Destino|Transportista|Patente)\b.*$", "", desc, flags=re.IGNORECASE).strip()
+        desc = re.sub(r"\b(Tipo Tratamiento|Tratamiento|Destino|Transportista|Patente)\b.*$", "", desc, flags=re.IGNORECASE).strip()
         if not desc:
             continue
         rows_out.append({
             "Código principal": _clean_cell(m.group("codigo")),
             "Descripción Residuo": desc,
-            "Cantidad (Kg)": _clean_cell(m.group("cantidad")),
-            "Tratamiento": "",
-            "Destino": "",
-            "Transportista": "",
-            "Patente": "",
+            "Cantidad (Kg)": qty,
+            "Tratamiento": _extract_labeled_value(body, ["Tipo Tratamiento", "Tratamiento"]),
+            "Destino": _extract_labeled_value(body, ["Destino"]),
+            "Transportista": _extract_labeled_value(body, ["Transportista"]),
+            "Patente": _extract_labeled_value(body, ["Patente"]),
             "Peligrosidad": "",
             "Estado contenedor": "",
             "Contenedor": "",
@@ -348,6 +389,123 @@ def parse_sinader_rows_from_text(full_text: str) -> List[Dict[str, str]]:
         key = (r.get("Código principal", ""), _norm(r.get("Descripción Residuo", "")), _clean_cell(r.get("Cantidad (Kg)", "")))
         uniq.setdefault(key, r)
     return list(uniq.values())
+
+
+def extract_global_treatment_from_text(full_text: str, known_treatments: Optional[List[str]] = None) -> str:
+    text = _cell_join_multiline(full_text or "")
+    if not text:
+        return ""
+    text_norm = _norm(text)
+    if known_treatments:
+        for term in sorted(known_treatments, key=lambda x: len(x), reverse=True):
+            term_norm = _norm(term)
+            if term_norm and term_norm in text_norm:
+                return term
+    patterns = [
+        r"(?:tipo\s*tratamiento|tratamiento)\s*[:\-]?\s*(reutilizaci[oó]n|reciclaje|combusti[oó]n|vertedero|anaerobic digestion)",
+        r"(?:tipo\s*tratamiento|tratamiento)\s*[:\-]?\s*([A-Za-zÁÉÍÓÚÜÑáéíóúüñ\s]{4,60})",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if m:
+            return _clean_cell(m.group(1))
+    return ""
+
+
+def _sanitize_treatment_and_logistics(
+    tratamiento: str,
+    destino: str,
+    transportista: str,
+    patente: str,
+    known_treatments: Optional[List[str]] = None,
+) -> Tuple[str, str, str, str]:
+    def _extract_treatment_phrase(text: str) -> str:
+        if not text:
+            return ""
+        text_norm = _norm(text)
+        if known_treatments:
+            for term in sorted(known_treatments, key=lambda x: len(x), reverse=True):
+                term_norm = _norm(term)
+                if not term_norm:
+                    continue
+                if term_norm in text_norm:
+                    return term
+                term_tokens = [t for t in term_norm.split() if len(t) > 3]
+                if term_tokens and all(t in text_norm for t in term_tokens):
+                    return term
+        if "degradacion" in text_norm and "anaerobica" in text_norm:
+            return "Degradación Anaeróbica"
+        candidates = [
+            r"relleno\s+sanitario",
+            r"sitio\s+de\s+escombros\s+de\s+la\s+construcci[oó]n",
+            r"reciclaje\s+de\s+pl[aá]sticos",
+            r"reciclaje\s+de\s+metales",
+            r"reciclaje\s+de\s+papel(?:,\s*cart[oó]n\s*y\s*productos\s*de\s*papel)?",
+            r"monorelleno",
+            r"compostaje",
+            r"reutilizaci[oó]n",
+            r"combusti[oó]n",
+            r"anaerobic\s+digestion",
+            r"reciclaje",
+        ]
+        for pat in candidates:
+            m = re.search(pat, text, flags=re.IGNORECASE)
+            if m:
+                return _clean_cell(m.group(0))
+        return ""
+
+    trt = _clean_cell(tratamiento)
+    dst = _clean_cell(destino)
+    trp = _clean_cell(transportista)
+    pat = _clean_cell(patente)
+    raw_combined = f"{trt} {dst}".strip()
+
+    if trt:
+        def _is_placeholder_destination(value: str) -> bool:
+            v = _norm(value)
+            return (not v) or v.startswith("in situ") or v.startswith("situ de efluentes")
+
+        kg_split = re.search(r"^(?P<prefix>.*?)(?P<qty>\d[\d\.,]*)\s*kg\s*(?P<after>.*)$", trt, flags=re.IGNORECASE)
+        if kg_split:
+            trt = _clean_cell(kg_split.group("prefix"))
+            trailing = _clean_cell(kg_split.group("after"))
+            if trailing and _is_placeholder_destination(dst):
+                dst = trailing
+        trt = re.sub(r"^\d[\d\.,]*\s*(kg|kgs?)\s*", "", trt, flags=re.IGNORECASE).strip()
+        if _norm(trt) in {"destino transportista patente", "destino transportista", "transportista patente"}:
+            trt = ""
+        if "|" in trt and not dst:
+            left, right = [x.strip() for x in trt.split("|", 1)]
+            if right:
+                trt = left
+                dst = right
+
+        labeled = re.search(
+            r"(?:^|\s)destino\s*[:\-]?\s*(?P<dst>.*?)(?:\s+transportista\s*[:\-]?\s*(?P<trp>.*?))?(?:\s+patente\s*[:\-]?\s*(?P<pat>.*))?$",
+            trt,
+            flags=re.IGNORECASE,
+        )
+        if labeled:
+            if not dst:
+                dst = _clean_cell(labeled.group("dst") or "")
+            if not trp:
+                trp = _clean_cell(labeled.group("trp") or "")
+            if not pat:
+                pat = _clean_cell(labeled.group("pat") or "")
+            trt = ""
+
+        phrase = _extract_treatment_phrase(trt)
+        if not phrase and raw_combined:
+            phrase = _extract_treatment_phrase(raw_combined)
+        if phrase:
+            remainder = _clean_cell(re.sub(re.escape(phrase), "", trt, count=1, flags=re.IGNORECASE))
+            if remainder and _is_placeholder_destination(dst):
+                dst = remainder
+            if dst:
+                dst = _clean_cell(re.sub(re.escape(phrase), "", dst, count=1, flags=re.IGNORECASE))
+            trt = phrase
+
+    return trt, dst, trp, pat
 
 
 def extract_sinader_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[str, str]]:
@@ -370,8 +528,20 @@ def extract_sinader_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[
             "Sin movimientos": "SI",
         }], meta
     detail_rows = parse_sinader_rows_from_tables(pdf_path) or parse_sinader_rows_from_text(full_text)
+    known_treatments = load_treatment_level3_terms()
+    global_treatment = extract_global_treatment_from_text(full_text, known_treatments)
     out_rows = []
     for i, r in enumerate(detail_rows, start=1):
+        row_treatment = _clean_cell(r.get("Tratamiento", ""))
+        if not row_treatment and global_treatment:
+            row_treatment = global_treatment
+        row_treatment, row_destino, row_transportista, row_patente = _sanitize_treatment_and_logistics(
+            row_treatment,
+            r.get("Destino", ""),
+            r.get("Transportista", ""),
+            r.get("Patente", ""),
+            known_treatments,
+        )
         out_rows.append({
             "N.": str(i),
             "Descripción Residuo": r.get("Descripción Residuo", ""),
@@ -380,10 +550,10 @@ def extract_sinader_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[
             "Cantidad (Kg)": r.get("Cantidad (Kg)", ""),
             "Estado contenedor": r.get("Estado contenedor", ""),
             "Contenedor": r.get("Contenedor", ""),
-            "Tratamiento": r.get("Tratamiento", ""),
-            "Destino": r.get("Destino", ""),
-            "Transportista": r.get("Transportista", ""),
-            "Patente": r.get("Patente", ""),
+            "Tratamiento": row_treatment,
+            "Destino": row_destino,
+            "Transportista": row_transportista,
+            "Patente": row_patente,
             "Sin movimientos": "NO",
         })
     return out_rows, meta
@@ -428,13 +598,220 @@ def choose_canonical_description(extracted_desc: str, codigo: str, catalog: Dict
     return scored[0][0] if scored[0][1] >= threshold else extracted_desc
 
 
-def apply_residuo_dictionary_correction(df: pd.DataFrame) -> pd.DataFrame:
+def _build_catalog_from_dataframe(df: pd.DataFrame) -> Dict[str, List[str]]:
+    if df.empty:
+        return {}
+    normalized_cols = {_norm(c): c for c in df.columns}
+    code_col = None
+    desc_col = None
+    code_candidates = [
+        "codigo principal",
+        "código principal",
+        "codigo",
+        "código",
+        "codigo residuo",
+        "código residuo",
+        "codigo sinader",
+        "código sinader",
+        "codigo ler",
+        "código ler",
+    ]
+    desc_candidates = [
+        "descripcion residuo",
+        "descripción residuo",
+        "descripcion",
+        "descripción",
+        "residuo",
+        "entry official name (en)",
+        "entry official name",
+        "capitulo oficial sinader (es)",
+        "subchapter official name (en)",
+    ]
+    declarable_col = None
+    declarable_candidates = [
+        "declarable en sinader?",
+        "¿declarable en sinader?",
+        "declarable en sinader",
+    ]
+    for candidate in code_candidates:
+        if candidate in normalized_cols:
+            code_col = normalized_cols[candidate]
+            break
+    for candidate in desc_candidates:
+        if candidate in normalized_cols:
+            desc_col = normalized_cols[candidate]
+            break
+    for candidate in declarable_candidates:
+        if candidate in normalized_cols:
+            declarable_col = normalized_cols[candidate]
+            break
+    if not code_col or not desc_col:
+        return {}
+    catalog: Dict[str, List[str]] = {}
+    required_cols = [code_col, desc_col] + ([declarable_col] if declarable_col else [])
+    for _, row in df[required_cols].dropna(subset=[code_col, desc_col]).iterrows():
+        if declarable_col:
+            declarable_value = _norm(_clean_cell(row.get(declarable_col, "")))
+            if declarable_value and declarable_value not in {"si", "sí", "s", "yes", "true"}:
+                continue
+        code = _normalize_code(row[code_col])
+        desc = _clean_cell(row[desc_col])
+        if not code or not desc:
+            continue
+        catalog.setdefault(code, [])
+        if desc not in catalog[code]:
+            catalog[code].append(desc)
+    return catalog
+
+
+def load_residuo_catalog(catalog_path: Optional[str] = None) -> Dict[str, List[str]]:
+    configured_path = (catalog_path or os.getenv("SINADER_CATALOG_PATH", "")).strip()
+    candidate_paths = [Path(configured_path)] if configured_path else []
+    candidate_paths.append(DEFAULT_CATALOG_PATH)
+    for path in candidate_paths:
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            excel_file = pd.ExcelFile(path)
+            sheet_candidates = [s for s in PREFERRED_CATALOG_SHEETS if s in excel_file.sheet_names]
+            sheet_candidates.extend([s for s in excel_file.sheet_names if s not in sheet_candidates])
+            for sheet_name in sheet_candidates:
+                df = pd.read_excel(path, sheet_name=sheet_name)
+                catalog = _build_catalog_from_dataframe(df)
+                if catalog:
+                    logger.info("Catálogo SINADER cargado desde %s (hoja=%s, códigos=%s)", path, sheet_name, len(catalog))
+                    return catalog
+            logger.warning("Catálogo SINADER en %s no tiene columnas válidas de código/descripcion", path)
+        except Exception as exc:
+            logger.warning("No se pudo cargar catálogo SINADER en %s: %s", path, exc)
+    return MASTER_RESIDUOS
+
+
+def _build_treatment_defra_map_from_dataframe(df: pd.DataFrame) -> Dict[str, str]:
+    if df.empty:
+        return {}
+    normalized_cols = {_norm(c): c for c in df.columns}
+    defra_col = None
+    treatment_col = None
+    defra_candidates = [
+        "defra",
+        "nombre defra",
+        "nombre defra (lista 1 exacta)",
+        "defra name",
+    ]
+    treatment_candidates = [
+        "tratamiento sinader",
+        "tratamiento",
+        "tratamiento sinader (es)",
+        "tipo tratamiento",
+        "sinader",
+    ]
+    for candidate in defra_candidates:
+        if candidate in normalized_cols:
+            defra_col = normalized_cols[candidate]
+            break
+    for candidate in treatment_candidates:
+        if candidate in normalized_cols:
+            treatment_col = normalized_cols[candidate]
+            break
+    if not defra_col or not treatment_col:
+        cols = list(df.columns[:2])
+        if len(cols) >= 2:
+            defra_col, treatment_col = cols[0], cols[1]
+        else:
+            return {}
+    mapping: Dict[str, str] = {}
+    for _, row in df[[defra_col, treatment_col]].dropna(how="any").iterrows():
+        defra_name = _clean_cell(row[defra_col])
+        treatment_name = _norm(_clean_cell(row[treatment_col]))
+        if not defra_name or not treatment_name:
+            continue
+        mapping[treatment_name] = defra_name
+    return mapping
+
+
+def load_treatment_defra_map(catalog_path: Optional[str] = None) -> Dict[str, str]:
+    configured_path = (catalog_path or os.getenv("SINADER_CATALOG_PATH", "")).strip()
+    candidate_paths = [Path(configured_path)] if configured_path else []
+    candidate_paths.append(DEFAULT_CATALOG_PATH)
+    for path in candidate_paths:
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            excel_file = pd.ExcelFile(path)
+            if TREATMENT_CATALOG_SHEET not in excel_file.sheet_names:
+                continue
+            df = pd.read_excel(path, sheet_name=TREATMENT_CATALOG_SHEET)
+            mapping = _build_treatment_defra_map_from_dataframe(df)
+            if mapping:
+                logger.info("Mapa Tratamiento->DEFRA cargado desde %s (hoja=%s, filas=%s)", path, TREATMENT_CATALOG_SHEET, len(mapping))
+                return mapping
+        except Exception as exc:
+            logger.warning("No se pudo cargar mapa de tratamientos SINADER en %s: %s", path, exc)
+    return dict(DEFAULT_TREATMENT_DEFRA_MAP)
+
+
+def load_treatment_level3_terms(catalog_path: Optional[str] = None) -> List[str]:
+    configured_path = (catalog_path or os.getenv("SINADER_CATALOG_PATH", "")).strip()
+    candidate_paths = [Path(configured_path)] if configured_path else []
+    candidate_paths.append(DEFAULT_CATALOG_PATH)
+    for path in candidate_paths:
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            excel_file = pd.ExcelFile(path)
+            if TREATMENT_CATALOG_SHEET not in excel_file.sheet_names:
+                continue
+            df = pd.read_excel(path, sheet_name=TREATMENT_CATALOG_SHEET)
+            normalized_cols = {_norm(c): c for c in df.columns}
+            level3_col = None
+            for candidate in ["nivel 3", "nivel3", "level 3", "tratamiento", "treatment"]:
+                if candidate in normalized_cols:
+                    level3_col = normalized_cols[candidate]
+                    break
+            if not level3_col:
+                continue
+            values = []
+            for value in df[level3_col].dropna().tolist():
+                text = _clean_cell(value)
+                if text:
+                    values.append(text)
+            unique_values = sorted(set(values), key=lambda x: len(x), reverse=True)
+            if unique_values:
+                logger.info("Tratamientos Nivel 3 cargados desde %s (hoja=%s, filas=%s)", path, TREATMENT_CATALOG_SHEET, len(unique_values))
+                return unique_values
+        except Exception as exc:
+            logger.warning("No se pudo cargar tratamientos Nivel 3 desde %s: %s", path, exc)
+    return []
+
+
+def map_treatment_to_defra(tratamiento: str, treatment_map: Dict[str, str]) -> str:
+    normalized_treatment = _norm(tratamiento)
+    if not normalized_treatment:
+        return ""
+    if normalized_treatment in treatment_map:
+        return treatment_map[normalized_treatment]
+    for key, defra_value in treatment_map.items():
+        if key in normalized_treatment:
+            return defra_value
+    return ""
+
+
+def apply_residuo_dictionary_correction(df: pd.DataFrame, catalog: Dict[str, List[str]]) -> pd.DataFrame:
     if "Descripción Residuo" not in df.columns or "Código principal" not in df.columns:
         return df
     df = df.copy()
     if "Descripción Residuo Original" not in df.columns:
         df["Descripción Residuo Original"] = df["Descripción Residuo"]
-    df["Descripción Residuo"] = df.apply(lambda r: choose_canonical_description(r.get("Descripción Residuo", ""), r.get("Código principal", ""), MASTER_RESIDUOS), axis=1)
+    df["Código principal"] = df["Código principal"].apply(_normalize_code)
+    df["Descripción Residuo"] = df.apply(
+        lambda r: choose_canonical_description(
+            r.get("Descripción Residuo", ""),
+            r.get("Código principal", ""),
+            catalog,
+        ),
+        axis=1,
+    )
     return df
 
 
@@ -568,7 +945,9 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
     df = df[cols] if not df.empty else pd.DataFrame(columns=preferred_cols)
     if "Cantidad (Kg)" in df.columns:
         df["Cantidad (Kg)"] = df["Cantidad (Kg)"].apply(_to_float_kg)
-    df = apply_residuo_dictionary_correction(df)
+    catalog = load_residuo_catalog()
+    df = apply_residuo_dictionary_correction(df, catalog)
+    treatment_defra_map = load_treatment_defra_map()
     if "DEFRA" not in df.columns:
         df["DEFRA"] = ""
     df["DEFRA"] = df.apply(
@@ -581,6 +960,11 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
         ),
         axis=1,
     )
+    if "Tratamiento" in df.columns:
+        df["DEFRA"] = df.apply(
+            lambda r: map_treatment_to_defra(r.get("Tratamiento", ""), treatment_defra_map) or r.get("DEFRA", ""),
+            axis=1,
+        )
     Path(output_excel).parent.mkdir(parents=True, exist_ok=True)
     df.to_excel(output_excel, index=False)
     logger.info("Excel generado: %s | filas=%s", output_excel, len(df))
