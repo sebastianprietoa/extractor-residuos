@@ -391,16 +391,10 @@ def parse_sinader_rows_from_text(full_text: str) -> List[Dict[str, str]]:
     return list(uniq.values())
 
 
-def extract_global_treatment_from_text(full_text: str, known_treatments: Optional[List[str]] = None) -> str:
+def extract_global_treatment_from_text(full_text: str) -> str:
     text = _cell_join_multiline(full_text or "")
     if not text:
         return ""
-    text_norm = _norm(text)
-    if known_treatments:
-        for term in sorted(known_treatments, key=lambda x: len(x), reverse=True):
-            term_norm = _norm(term)
-            if term_norm and term_norm in text_norm:
-                return term
     patterns = [
         r"(?:tipo\s*tratamiento|tratamiento)\s*[:\-]?\s*(reutilizaci[oó]n|reciclaje|combusti[oó]n|vertedero|anaerobic digestion)",
         r"(?:tipo\s*tratamiento|tratamiento)\s*[:\-]?\s*([A-Za-zÁÉÍÓÚÜÑáéíóúüñ\s]{4,60})",
@@ -417,22 +411,11 @@ def _sanitize_treatment_and_logistics(
     destino: str,
     transportista: str,
     patente: str,
-    known_treatments: Optional[List[str]] = None,
 ) -> Tuple[str, str, str, str]:
     def _extract_treatment_phrase(text: str) -> str:
         if not text:
             return ""
         text_norm = _norm(text)
-        if known_treatments:
-            for term in sorted(known_treatments, key=lambda x: len(x), reverse=True):
-                term_norm = _norm(term)
-                if not term_norm:
-                    continue
-                if term_norm in text_norm:
-                    return term
-                term_tokens = [t for t in term_norm.split() if len(t) > 3]
-                if term_tokens and all(t in text_norm for t in term_tokens):
-                    return term
         if "degradacion" in text_norm and "anaerobica" in text_norm:
             return "Degradación Anaeróbica"
         candidates = [
@@ -510,8 +493,7 @@ def extract_sinader_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[
             "Sin movimientos": "SI",
         }], meta
     detail_rows = parse_sinader_rows_from_tables(pdf_path) or parse_sinader_rows_from_text(full_text)
-    known_treatments = load_treatment_level3_terms()
-    global_treatment = extract_global_treatment_from_text(full_text, known_treatments)
+    global_treatment = extract_global_treatment_from_text(full_text)
     out_rows = []
     for i, r in enumerate(detail_rows, start=1):
         row_treatment = _clean_cell(r.get("Tratamiento", ""))
@@ -522,7 +504,6 @@ def extract_sinader_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[
             r.get("Destino", ""),
             r.get("Transportista", ""),
             r.get("Patente", ""),
-            known_treatments,
         )
         out_rows.append({
             "N.": str(i),
@@ -733,7 +714,38 @@ def load_treatment_defra_map(catalog_path: Optional[str] = None) -> Dict[str, st
     return dict(DEFAULT_TREATMENT_DEFRA_MAP)
 
 
-def load_treatment_level3_terms(catalog_path: Optional[str] = None) -> List[str]:
+def map_treatment_to_defra(tratamiento: str, treatment_map: Dict[str, str]) -> str:
+    normalized_treatment = _norm(tratamiento)
+    if not normalized_treatment:
+        return ""
+    if normalized_treatment in treatment_map:
+        return treatment_map[normalized_treatment]
+    for key, defra_value in treatment_map.items():
+        if key in normalized_treatment:
+            return defra_value
+    return ""
+
+
+def _build_treatment_level3_from_dataframe(df: pd.DataFrame) -> List[str]:
+    if df.empty:
+        return []
+    normalized_cols = {_norm(c): c for c in df.columns}
+    lvl3_col = None
+    for candidate in ["nivel 3", "nivel3", "tipo tratamiento", "tratamiento"]:
+        if candidate in normalized_cols:
+            lvl3_col = normalized_cols[candidate]
+            break
+    if not lvl3_col:
+        return []
+    values: List[str] = []
+    for value in df[lvl3_col].dropna().tolist():
+        cleaned = _clean_cell(value)
+        if cleaned and cleaned not in values:
+            values.append(cleaned)
+    return values
+
+
+def load_treatment_level3_catalog(catalog_path: Optional[str] = None) -> List[str]:
     configured_path = (catalog_path or os.getenv("SINADER_CATALOG_PATH", "")).strip()
     candidate_paths = [Path(configured_path)] if configured_path else []
     candidate_paths.append(DEFAULT_CATALOG_PATH)
@@ -745,38 +757,49 @@ def load_treatment_level3_terms(catalog_path: Optional[str] = None) -> List[str]
             if TREATMENT_CATALOG_SHEET not in excel_file.sheet_names:
                 continue
             df = pd.read_excel(path, sheet_name=TREATMENT_CATALOG_SHEET)
-            normalized_cols = {_norm(c): c for c in df.columns}
-            level3_col = None
-            for candidate in ["nivel 3", "nivel3", "level 3", "tratamiento", "treatment"]:
-                if candidate in normalized_cols:
-                    level3_col = normalized_cols[candidate]
-                    break
-            if not level3_col:
-                continue
-            values = []
-            for value in df[level3_col].dropna().tolist():
-                text = _clean_cell(value)
-                if text:
-                    values.append(text)
-            unique_values = sorted(set(values), key=lambda x: len(x), reverse=True)
-            if unique_values:
-                logger.info("Tratamientos Nivel 3 cargados desde %s (hoja=%s, filas=%s)", path, TREATMENT_CATALOG_SHEET, len(unique_values))
-                return unique_values
+            level3 = _build_treatment_level3_from_dataframe(df)
+            if level3:
+                logger.info("Catálogo de tratamientos Nivel 3 cargado desde %s (%s valores)", path, len(level3))
+                return level3
         except Exception as exc:
-            logger.warning("No se pudo cargar tratamientos Nivel 3 desde %s: %s", path, exc)
-    return []
+            logger.warning("No se pudo cargar catálogo Nivel 3 en %s: %s", path, exc)
+    return [
+        "Relleno sanitario",
+        "Vertedero",
+        "Monorelleno",
+        "Compostaje",
+        "Degradación Anaeróbica",
+        "Reciclaje de plásticos",
+        "Reciclaje de metales",
+        "Reciclaje de papel, cartón y productos de papel",
+        "Sitio de escombros de la construcción",
+    ]
 
 
-def map_treatment_to_defra(tratamiento: str, treatment_map: Dict[str, str]) -> str:
-    normalized_treatment = _norm(tratamiento)
-    if not normalized_treatment:
-        return ""
-    if normalized_treatment in treatment_map:
-        return treatment_map[normalized_treatment]
-    for key, defra_value in treatment_map.items():
-        if key in normalized_treatment:
-            return defra_value
-    return ""
+def choose_canonical_treatment(extracted_treatment: str, level3_catalog: List[str], threshold: float = 0.6) -> str:
+    extracted_treatment = _clean_cell(extracted_treatment)
+    if not extracted_treatment:
+        return extracted_treatment
+    if not level3_catalog:
+        return extracted_treatment
+    norm_extracted = _norm(extracted_treatment)
+    if "degradacion" in norm_extracted and "anaerobica" in norm_extracted:
+        for candidate in level3_catalog:
+            if "degradacion" in _norm(candidate) and "anaerobica" in _norm(candidate):
+                return candidate
+    scored: List[Tuple[str, float]] = []
+    for candidate in level3_catalog:
+        norm_candidate = _norm(candidate)
+        if not norm_candidate:
+            continue
+        if norm_candidate in norm_extracted or norm_extracted in norm_candidate:
+            scored.append((candidate, 1.0))
+            continue
+        score = SequenceMatcher(None, norm_extracted, norm_candidate).ratio()
+        scored.append((candidate, score))
+    scored.sort(key=lambda x: x[1], reverse=True)
+    best_candidate, best_score = scored[0]
+    return best_candidate if best_score >= threshold else extracted_treatment
 
 
 def apply_residuo_dictionary_correction(df: pd.DataFrame, catalog: Dict[str, List[str]]) -> pd.DataFrame:
@@ -929,7 +952,12 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
         df["Cantidad (Kg)"] = df["Cantidad (Kg)"].apply(_to_float_kg)
     catalog = load_residuo_catalog()
     df = apply_residuo_dictionary_correction(df, catalog)
+    treatment_level3_catalog = load_treatment_level3_catalog()
     treatment_defra_map = load_treatment_defra_map()
+    if "Tratamiento" in df.columns:
+        if "Tratamiento Original" not in df.columns:
+            df["Tratamiento Original"] = df["Tratamiento"]
+        df["Tratamiento"] = df["Tratamiento"].apply(lambda x: choose_canonical_treatment(x, treatment_level3_catalog))
     if "DEFRA" not in df.columns:
         df["DEFRA"] = ""
     df["DEFRA"] = df.apply(
