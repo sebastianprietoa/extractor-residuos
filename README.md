@@ -105,4 +105,3 @@ bash -lc 'if [ "$APP_MODE" = "streamlit" ]; then /app/.venv/bin/python -m stream
 - Si luego quieres interfaz web, se puede agregar HTML/Jinja o React encima de esta API.
 - Para catálogo SINADER en Excel se prioriza la hoja `LER_completo_842` (si existe) y columnas como `Código LER` + `Entry official name (EN)`/`Descripción`; también filtra `¿Declarable en SINADER? = Sí` cuando esa columna está presente.
 - Para mapear `Tratamiento` a nombres `DEFRA` se usa la hoja `Tratamiento_SINADER`; si no existe, se aplica un mapeo base (`Reutilización→Re-use`, `Reciclaje→Open-loop`, `Combustión→Combustion`, `Vertedero→Landfill`, `Anaerobic digestion→Anaerobic digestion`).
-- Si la hoja `Tratamiento_SINADER` incluye columna `Nivel 3`, el valor extraído de `Tratamiento` se normaliza contra esa taxonomía (fuzzy/contención) para evitar textos mezclados con kilos, destino o nombre de gestor.
