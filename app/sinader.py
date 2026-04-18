@@ -417,6 +417,7 @@ def _sanitize_treatment_and_logistics(
     destino: str,
     transportista: str,
     patente: str,
+    cantidad: str = "",
     known_treatments: Optional[List[str]] = None,
 ) -> Tuple[str, str, str, str]:
     def _extract_treatment_phrase(text: str) -> str:
@@ -458,10 +459,44 @@ def _sanitize_treatment_and_logistics(
     dst = _clean_cell(destino)
     trp = _clean_cell(transportista)
     pat = _clean_cell(patente)
+    raw_combined = f"{trt} {dst}".strip()
 
     if trt:
+        def _is_placeholder_destination(value: str) -> bool:
+            v = _norm(value)
+            return (not v) or v.startswith("in situ") or v.startswith("situ de efluentes")
+
+        def _tail_after_qty_kg(text: str, qty_value: str) -> str:
+            if not text:
+                return ""
+            qty_digits = re.sub(r"\D", "", _clean_cell(qty_value))
+            matches = list(re.finditer(r"(\d[\d\.,]*)\s*kg\b", text, flags=re.IGNORECASE))
+            if not matches:
+                return ""
+            if not qty_digits:
+                return _clean_cell(text[matches[0].end():])
+            for m in matches:
+                m_digits = re.sub(r"\D", "", m.group(1))
+                if m_digits == qty_digits:
+                    return _clean_cell(text[m.end():])
+            return ""
+
+        tail_by_qty = _tail_after_qty_kg(raw_combined, cantidad)
+        if tail_by_qty:
+            phrase_from_tail = _extract_treatment_phrase(tail_by_qty)
+            if phrase_from_tail:
+                trt = phrase_from_tail
+                remainder_tail = _clean_cell(re.sub(re.escape(phrase_from_tail), "", tail_by_qty, count=1, flags=re.IGNORECASE))
+                if remainder_tail and _is_placeholder_destination(dst):
+                    dst = remainder_tail
+
+        kg_split = re.search(r"^(?P<prefix>.*?)(?P<qty>\d[\d\.,]*)\s*kg\s*(?P<after>.*)$", trt, flags=re.IGNORECASE)
+        if kg_split:
+            trt = _clean_cell(kg_split.group("prefix"))
+            trailing = _clean_cell(kg_split.group("after"))
+            if trailing and _is_placeholder_destination(dst):
+                dst = trailing
         trt = re.sub(r"^\d[\d\.,]*\s*(kg|kgs?)\s*", "", trt, flags=re.IGNORECASE).strip()
-        trt = re.sub(r"^(in\s+|en\s+)", "", trt, flags=re.IGNORECASE).strip()
         if _norm(trt) in {"destino transportista patente", "destino transportista", "transportista patente"}:
             trt = ""
         if "|" in trt and not dst:
@@ -484,18 +519,16 @@ def _sanitize_treatment_and_logistics(
                 pat = _clean_cell(labeled.group("pat") or "")
             trt = ""
 
-        phrase = _extract_treatment_phrase(" ".join(x for x in [trt, dst] if x))
+        phrase = _extract_treatment_phrase(trt)
+        if not phrase and raw_combined:
+            phrase = _extract_treatment_phrase(raw_combined)
         if phrase:
-            trt = phrase
-            dst = re.sub(re.escape(phrase), "", dst, flags=re.IGNORECASE).strip(" -|,")
-            for token in [t for t in _norm(phrase).split() if len(t) > 4]:
-                dst = re.sub(token, "", _strip_accents(dst), flags=re.IGNORECASE).strip(" -|,")
+            remainder = _clean_cell(re.sub(re.escape(phrase), "", trt, count=1, flags=re.IGNORECASE))
+            if remainder and _is_placeholder_destination(dst):
+                dst = remainder
             if dst:
-                dst = _clean_cell(dst)
-
-    if dst and re.search(r"transporti?|transportista|patente", dst, flags=re.IGNORECASE):
-        dst = re.sub(r"\(?\|?\s*kg\)?", "", dst, flags=re.IGNORECASE)
-        dst = re.sub(r"transport\w*|patente", "", dst, flags=re.IGNORECASE).strip(" -|,")
+                dst = _clean_cell(re.sub(re.escape(phrase), "", dst, count=1, flags=re.IGNORECASE))
+            trt = phrase
 
     return trt, dst, trp, pat
 
@@ -532,6 +565,7 @@ def extract_sinader_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[
             r.get("Destino", ""),
             r.get("Transportista", ""),
             r.get("Patente", ""),
+            r.get("Cantidad (Kg)", ""),
             known_treatments,
         )
         out_rows.append({
