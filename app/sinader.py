@@ -463,7 +463,7 @@ def _sanitize_treatment_and_logistics(
     pat = _clean_cell(patente)
     raw_combined = f"{trt} {dst}".strip()
 
-    if trt:
+    if trt or dst:
         def _is_placeholder_destination(value: str) -> bool:
             v = _norm(value)
             return (not v) or v.startswith("in situ") or v.startswith("situ de efluentes")
@@ -531,6 +531,35 @@ def _sanitize_treatment_and_logistics(
             if dst:
                 dst = _clean_cell(re.sub(re.escape(phrase), "", dst, count=1, flags=re.IGNORECASE))
             trt = phrase
+
+        combined_all = _clean_cell(" ".join(x for x in [trt, dst, trp, pat] if _clean_cell(x)))
+        phrase_all = _extract_treatment_phrase(combined_all) if combined_all else ""
+        if phrase_all:
+            trt = phrase_all
+            cleaned = combined_all
+            cleaned = re.sub(re.escape(phrase_all), " ", cleaned, count=1, flags=re.IGNORECASE)
+            cleaned = re.sub(r"\d[\d\.,]*\s*kg\b", " ", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r"\b(destino|transportista|patente)\b", " ", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r"\bin\s*situ\s*de\s*efluentes\b", " ", cleaned, flags=re.IGNORECASE)
+            if not trp:
+                m_trp = re.search(r"\b(\d+)\|?\b", cleaned)
+                if m_trp:
+                    trp = f"{m_trp.group(1)}|"
+                    cleaned = cleaned.replace(m_trp.group(0), " ")
+            cleaned = re.sub(r"\d+\|", " ", cleaned)
+            cleaned = re.sub(r"\b\d+\b", " ", cleaned)
+            if not pat:
+                m_pat = re.search(r"\b([A-Z]{2,4}-[A-Z0-9]{2,4})\b", cleaned)
+                if m_pat:
+                    pat = m_pat.group(1)
+                    cleaned = cleaned.replace(m_pat.group(1), " ")
+            candidate_dst = _clean_cell(re.sub(r"\s+", " ", cleaned).strip(" |-_/"))
+            if candidate_dst and _is_placeholder_destination(dst):
+                dst = candidate_dst
+
+        if dst:
+            dst = re.sub(r"\d+\|", " ", dst)
+            dst = _clean_cell(re.sub(r"\s+", " ", dst))
 
     return trt, dst, trp, pat
 
