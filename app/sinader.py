@@ -43,6 +43,18 @@ MASTER_RESIDUOS: Dict[str, List[str]] = {
 DEFAULT_CATALOG_PATH = Path("assets/sinader_codigos.xlsx")
 PREFERRED_CATALOG_SHEETS = ("LER_completo_842",)
 TREATMENT_CATALOG_SHEET = "Tratamiento_SINADER"
+DEFAULT_TREATMENT_LEVEL3 = [
+    "Relleno sanitario",
+    "Vertedero",
+    "Monorelleno",
+    "Recepción de lodos en PTAS",
+    "Sitio de escombros de la construcción",
+    "Degradación Anaeróbica",
+    "Compostaje",
+    "Pretratamiento de papel, cartón y productos de papel",
+    "Pretratamiento de metales",
+    "Pretratamiento de plásticos",
+]
 DEFAULT_TREATMENT_DEFRA_MAP = {
     "reutilizacion": "Re-use",
     "reciclaje": "Open-loop",
@@ -714,30 +726,12 @@ def load_treatment_defra_map(catalog_path: Optional[str] = None) -> Dict[str, st
     return dict(DEFAULT_TREATMENT_DEFRA_MAP)
 
 
-def map_treatment_to_defra(tratamiento: str, treatment_map: Dict[str, str]) -> str:
-    normalized_treatment = _norm(tratamiento)
-    if not normalized_treatment:
-        return ""
-    if normalized_treatment in treatment_map:
-        return treatment_map[normalized_treatment]
-    for key, defra_value in treatment_map.items():
-        if key in normalized_treatment:
-            return defra_value
-    return ""
-
-
-def _build_treatment_level3_catalog_from_dataframe(df: pd.DataFrame) -> List[str]:
+def _build_treatment_level3_terms_from_dataframe(df: pd.DataFrame) -> List[str]:
     if df.empty:
         return []
     normalized_cols = {_norm(c): c for c in df.columns}
     level3_col = None
-    level3_candidates = [
-        "nivel 3",
-        "nivel3",
-        "nivel iii",
-        "tratamiento",
-        "tipo tratamiento",
-    ]
+    level3_candidates = ["nivel 3", "nivel3", "level 3", "tipo anotado expandido", "tratamiento sinader"]
     for candidate in level3_candidates:
         if candidate in normalized_cols:
             level3_col = normalized_cols[candidate]
@@ -745,20 +739,14 @@ def _build_treatment_level3_catalog_from_dataframe(df: pd.DataFrame) -> List[str
     if not level3_col:
         return []
     values = []
-    seen = set()
-    for raw in df[level3_col].dropna().tolist():
-        item = _clean_cell(raw)
-        if not item:
-            continue
-        key = _norm(item)
-        if key in seen:
-            continue
-        seen.add(key)
-        values.append(item)
+    for val in df[level3_col].dropna().tolist():
+        clean = _clean_cell(val)
+        if clean and clean not in values:
+            values.append(clean)
     return values
 
 
-def load_treatment_level3_catalog(catalog_path: Optional[str] = None) -> List[str]:
+def load_treatment_level3_terms(catalog_path: Optional[str] = None) -> List[str]:
     configured_path = (catalog_path or os.getenv("SINADER_CATALOG_PATH", "")).strip()
     candidate_paths = [Path(configured_path)] if configured_path else []
     candidate_paths.append(DEFAULT_CATALOG_PATH)
@@ -770,36 +758,49 @@ def load_treatment_level3_catalog(catalog_path: Optional[str] = None) -> List[st
             if TREATMENT_CATALOG_SHEET not in excel_file.sheet_names:
                 continue
             df = pd.read_excel(path, sheet_name=TREATMENT_CATALOG_SHEET)
-            catalog = _build_treatment_level3_catalog_from_dataframe(df)
-            if catalog:
-                logger.info("Catálogo Tratamiento Nivel3 cargado desde %s (hoja=%s, items=%s)", path, TREATMENT_CATALOG_SHEET, len(catalog))
-                return catalog
+            terms = _build_treatment_level3_terms_from_dataframe(df)
+            if terms:
+                logger.info("Términos Nivel 3 cargados desde %s (hoja=%s, términos=%s)", path, TREATMENT_CATALOG_SHEET, len(terms))
+                return terms
         except Exception as exc:
-            logger.warning("No se pudo cargar catálogo Nivel3 de tratamientos en %s: %s", path, exc)
-    return []
+            logger.warning("No se pudo cargar Nivel 3 de tratamientos SINADER en %s: %s", path, exc)
+    return list(DEFAULT_TREATMENT_LEVEL3)
 
 
-def choose_canonical_treatment(extracted_treatment: str, level3_catalog: List[str], threshold: float = 0.62) -> str:
-    extracted = _clean_cell(extracted_treatment)
-    if not extracted or not level3_catalog:
-        return extracted
-    extracted_norm = _normalize_for_match(extracted)
-    if not extracted_norm:
-        return extracted
-    best_text = extracted
-    best_score = 0.0
-    for candidate in level3_catalog:
-        cand_norm = _normalize_for_match(candidate)
-        if not cand_norm:
-            continue
-        if cand_norm in extracted_norm or extracted_norm in cand_norm:
-            score = 1.0
-        else:
-            score = SequenceMatcher(None, extracted_norm, cand_norm).ratio()
-        if score > best_score:
-            best_score = score
-            best_text = candidate
-    return best_text if best_score >= threshold else extracted
+def canonicalize_treatment_level3(extracted_treatment: str, level3_terms: List[str], threshold: float = 0.72) -> str:
+    raw = _clean_cell(extracted_treatment)
+    if not raw:
+        return ""
+    if not level3_terms:
+        return raw
+    raw_norm = _normalize_for_match(raw)
+    if "degradacion" in raw_norm and "anaerobica" in raw_norm:
+        for term in level3_terms:
+            term_norm = _normalize_for_match(term)
+            if "degradacion" in term_norm and "anaerobica" in term_norm:
+                return term
+    for term in level3_terms:
+        term_norm = _normalize_for_match(term)
+        if term_norm and (term_norm in raw_norm or raw_norm in term_norm):
+            return term
+    scored = sorted(
+        [(term, _prefix_similarity(raw, term)) for term in level3_terms],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    return scored[0][0] if scored and scored[0][1] >= threshold else raw
+
+
+def map_treatment_to_defra(tratamiento: str, treatment_map: Dict[str, str]) -> str:
+    normalized_treatment = _norm(tratamiento)
+    if not normalized_treatment:
+        return ""
+    if normalized_treatment in treatment_map:
+        return treatment_map[normalized_treatment]
+    for key, defra_value in treatment_map.items():
+        if key in normalized_treatment:
+            return defra_value
+    return ""
 
 
 def apply_residuo_dictionary_correction(df: pd.DataFrame, catalog: Dict[str, List[str]]) -> pd.DataFrame:
@@ -952,14 +953,10 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
         df["Cantidad (Kg)"] = df["Cantidad (Kg)"].apply(_to_float_kg)
     catalog = load_residuo_catalog()
     df = apply_residuo_dictionary_correction(df, catalog)
+    treatment_level3_terms = load_treatment_level3_terms()
     treatment_defra_map = load_treatment_defra_map()
-    treatment_level3_catalog = load_treatment_level3_catalog()
     if "Tratamiento" in df.columns:
-        if "Tratamiento Original" not in df.columns:
-            df["Tratamiento Original"] = df["Tratamiento"]
-        df["Tratamiento"] = df["Tratamiento"].apply(
-            lambda t: choose_canonical_treatment(t, treatment_level3_catalog)
-        )
+        df["Tratamiento"] = df["Tratamiento"].apply(lambda x: canonicalize_treatment_level3(x, treatment_level3_terms))
     if "DEFRA" not in df.columns:
         df["DEFRA"] = ""
     df["DEFRA"] = df.apply(
