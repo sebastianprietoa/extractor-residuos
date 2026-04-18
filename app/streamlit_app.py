@@ -7,6 +7,7 @@ import zipfile
 from pathlib import Path
 from typing import Iterable
 
+import pandas as pd
 import streamlit as st
 
 from app.autocontrol import process_folder as process_autocontrol
@@ -181,6 +182,31 @@ def _zip_outputs(items: list[tuple[str, bytes]]) -> bytes:
     return buff.read()
 
 
+def _render_preview_from_excel(path: Path, title: str) -> None:
+    try:
+        df = pd.read_excel(path)
+    except Exception as exc:
+        st.warning(f"No se pudo generar previsualización de {title}: {exc}")
+        return
+    st.markdown(f"#### 👀 Previsualización — {title}")
+    preferred = [c for c in ["FuentePDF", "N.", "Descripción Residuo", "Código principal", "Cantidad (Kg)", "Tratamiento", "Destino", "Transportista", "Patente", "DEFRA"] if c in df.columns]
+    view = df[preferred] if preferred else df
+    st.dataframe(view.head(20), use_container_width=True)
+
+
+def _render_sinader_extraction_details() -> None:
+    with st.expander("🧠 ¿Cómo se está extrayendo Tratamiento en SINADER?"):
+        st.markdown(
+            """
+            1. Se extrae tabla por página (Residuo, Cantidad, Tipo Tratamiento, Destino, Transportista, Patente).  
+            2. Se usa **Cantidad + `kg`** como ancla para separar texto de tratamiento y destino cuando vienen mezclados.  
+            3. Se normaliza tratamiento contra catálogo de `Tratamiento_SINADER` (Nivel 3), por ejemplo:
+               `Reciclaje de plásticos`, `Relleno sanitario`, `Sitio de Escombros de la Construcción`.  
+            4. Si viene texto ruidoso, se limpia y se reubica en columnas correctas.
+            """
+        )
+
+
 def main() -> None:
     _render_header()
     st.markdown("---")
@@ -205,6 +231,8 @@ def main() -> None:
                 st.session_state.source_mode = mode
         source = st.session_state.source_mode
         st.caption(f"Modo actual: {source}")
+        if source == "SINADER":
+            st.caption("Tratamiento se normaliza usando catálogo Nivel 3 + ancla de cantidad (kg).")
         st.caption("Puedes subir PDFs o escoger carpeta desde explorador local (si ejecutas en tu PC).")
         branding_logo = _logo_source("logo_right.png", "GT_LOGO_RIGHT_URL", DEFAULT_RIGHT_LOGO_URL)
         if branding_logo:
@@ -274,18 +302,22 @@ def main() -> None:
                 if source == "SINADER":
                     output = tmp / "sinader_output.xlsx"
                     process_sinader(str(input_dir), str(output))
+                    _render_sinader_extraction_details()
+                    _render_preview_from_excel(output, "SINADER")
                     data = output.read_bytes()
                     filename = output.name
                     mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 elif source == "SINDREP":
                     output = tmp / "sindrep_output.xlsx"
                     process_sindrep(str(input_dir), str(output))
+                    _render_preview_from_excel(output, "SINDREP")
                     data = output.read_bytes()
                     filename = output.name
                     mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 elif source == "AUTOCONTROL":
                     output = tmp / "autocontrol_output.xlsx"
                     process_autocontrol(str(input_dir), str(output))
+                    _render_preview_from_excel(output, "AUTOCONTROL")
                     data = output.read_bytes()
                     filename = output.name
                     mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -294,6 +326,9 @@ def main() -> None:
                     out_sindrep = tmp / "sindrep_output.xlsx"
                     process_sinader(str(input_dir), str(out_sinader))
                     process_sindrep(str(input_dir), str(out_sindrep))
+                    _render_sinader_extraction_details()
+                    _render_preview_from_excel(out_sinader, "SINADER")
+                    _render_preview_from_excel(out_sindrep, "SINDREP")
                     data = _zip_outputs([
                         (out_sinader.name, _read_file_bytes(out_sinader)),
                         (out_sindrep.name, _read_file_bytes(out_sindrep)),
@@ -322,6 +357,7 @@ def main() -> None:
             if source == "AUTOCONTROL":
                 output = tmp / "autocontrol_output.xlsx"
                 process_autocontrol(str(input_dir), str(output))
+                _render_preview_from_excel(output, "AUTOCONTROL")
                 data = _read_file_bytes(output)
                 st.success(f"Proceso AUTOCONTROL completado. PDFs procesados: {total}")
                 st.download_button(
@@ -337,11 +373,14 @@ def main() -> None:
             if source in {"SINADER", "AMBOS"}:
                 out_sinader = tmp / "sinader_output.xlsx"
                 process_sinader(str(input_dir), str(out_sinader))
+                _render_sinader_extraction_details()
+                _render_preview_from_excel(out_sinader, "SINADER")
                 outputs.append((out_sinader.name, _read_file_bytes(out_sinader)))
 
             if source in {"SINDREP", "AMBOS"}:
                 out_sindrep = tmp / "sindrep_output.xlsx"
                 process_sindrep(str(input_dir), str(out_sindrep))
+                _render_preview_from_excel(out_sindrep, "SINDREP")
                 outputs.append((out_sindrep.name, _read_file_bytes(out_sindrep)))
 
     st.success(f"Proceso completado. PDFs procesados: {total}")

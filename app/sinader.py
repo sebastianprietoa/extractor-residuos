@@ -823,6 +823,26 @@ def map_treatment_to_defra(tratamiento: str, treatment_map: Dict[str, str]) -> s
     return ""
 
 
+def choose_canonical_treatment(extracted_treatment: str, known_treatments: List[str], threshold: float = 0.58) -> str:
+    raw = _clean_cell(extracted_treatment)
+    if not raw or not known_treatments:
+        return raw
+    a = _normalize_for_match(raw)
+    if not a:
+        return raw
+    best_term = raw
+    best_score = 0.0
+    for term in known_treatments:
+        b = _normalize_for_match(term)
+        if not b:
+            continue
+        score = 1.0 if (a in b or b in a) else SequenceMatcher(None, a, b).ratio()
+        if score > best_score:
+            best_score = score
+            best_term = term
+    return best_term if best_score >= threshold else raw
+
+
 def apply_residuo_dictionary_correction(df: pd.DataFrame, catalog: Dict[str, List[str]]) -> pd.DataFrame:
     if "Descripción Residuo" not in df.columns or "Código principal" not in df.columns:
         return df
@@ -973,6 +993,11 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
         df["Cantidad (Kg)"] = df["Cantidad (Kg)"].apply(_to_float_kg)
     catalog = load_residuo_catalog()
     df = apply_residuo_dictionary_correction(df, catalog)
+    known_treatments = load_treatment_level3_terms()
+    if "Tratamiento" in df.columns and known_treatments:
+        if "Tratamiento Original" not in df.columns:
+            df["Tratamiento Original"] = df["Tratamiento"]
+        df["Tratamiento"] = df["Tratamiento"].apply(lambda x: choose_canonical_treatment(x, known_treatments))
     treatment_defra_map = load_treatment_defra_map()
     if "DEFRA" not in df.columns:
         df["DEFRA"] = ""
