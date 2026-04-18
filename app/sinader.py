@@ -726,22 +726,35 @@ def map_treatment_to_defra(tratamiento: str, treatment_map: Dict[str, str]) -> s
     return ""
 
 
-def _build_treatment_level3_from_dataframe(df: pd.DataFrame) -> List[str]:
+def _build_treatment_level3_catalog_from_dataframe(df: pd.DataFrame) -> List[str]:
     if df.empty:
         return []
     normalized_cols = {_norm(c): c for c in df.columns}
-    lvl3_col = None
-    for candidate in ["nivel 3", "nivel3", "tipo tratamiento", "tratamiento"]:
+    level3_col = None
+    level3_candidates = [
+        "nivel 3",
+        "nivel3",
+        "nivel iii",
+        "tratamiento",
+        "tipo tratamiento",
+    ]
+    for candidate in level3_candidates:
         if candidate in normalized_cols:
-            lvl3_col = normalized_cols[candidate]
+            level3_col = normalized_cols[candidate]
             break
-    if not lvl3_col:
+    if not level3_col:
         return []
-    values: List[str] = []
-    for value in df[lvl3_col].dropna().tolist():
-        cleaned = _clean_cell(value)
-        if cleaned and cleaned not in values:
-            values.append(cleaned)
+    values = []
+    seen = set()
+    for raw in df[level3_col].dropna().tolist():
+        item = _clean_cell(raw)
+        if not item:
+            continue
+        key = _norm(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        values.append(item)
     return values
 
 
@@ -757,49 +770,36 @@ def load_treatment_level3_catalog(catalog_path: Optional[str] = None) -> List[st
             if TREATMENT_CATALOG_SHEET not in excel_file.sheet_names:
                 continue
             df = pd.read_excel(path, sheet_name=TREATMENT_CATALOG_SHEET)
-            level3 = _build_treatment_level3_from_dataframe(df)
-            if level3:
-                logger.info("Catálogo de tratamientos Nivel 3 cargado desde %s (%s valores)", path, len(level3))
-                return level3
+            catalog = _build_treatment_level3_catalog_from_dataframe(df)
+            if catalog:
+                logger.info("Catálogo Tratamiento Nivel3 cargado desde %s (hoja=%s, items=%s)", path, TREATMENT_CATALOG_SHEET, len(catalog))
+                return catalog
         except Exception as exc:
-            logger.warning("No se pudo cargar catálogo Nivel 3 en %s: %s", path, exc)
-    return [
-        "Relleno sanitario",
-        "Vertedero",
-        "Monorelleno",
-        "Compostaje",
-        "Degradación Anaeróbica",
-        "Reciclaje de plásticos",
-        "Reciclaje de metales",
-        "Reciclaje de papel, cartón y productos de papel",
-        "Sitio de escombros de la construcción",
-    ]
+            logger.warning("No se pudo cargar catálogo Nivel3 de tratamientos en %s: %s", path, exc)
+    return []
 
 
-def choose_canonical_treatment(extracted_treatment: str, level3_catalog: List[str], threshold: float = 0.6) -> str:
-    extracted_treatment = _clean_cell(extracted_treatment)
-    if not extracted_treatment:
-        return extracted_treatment
-    if not level3_catalog:
-        return extracted_treatment
-    norm_extracted = _norm(extracted_treatment)
-    if "degradacion" in norm_extracted and "anaerobica" in norm_extracted:
-        for candidate in level3_catalog:
-            if "degradacion" in _norm(candidate) and "anaerobica" in _norm(candidate):
-                return candidate
-    scored: List[Tuple[str, float]] = []
+def choose_canonical_treatment(extracted_treatment: str, level3_catalog: List[str], threshold: float = 0.62) -> str:
+    extracted = _clean_cell(extracted_treatment)
+    if not extracted or not level3_catalog:
+        return extracted
+    extracted_norm = _normalize_for_match(extracted)
+    if not extracted_norm:
+        return extracted
+    best_text = extracted
+    best_score = 0.0
     for candidate in level3_catalog:
-        norm_candidate = _norm(candidate)
-        if not norm_candidate:
+        cand_norm = _normalize_for_match(candidate)
+        if not cand_norm:
             continue
-        if norm_candidate in norm_extracted or norm_extracted in norm_candidate:
-            scored.append((candidate, 1.0))
-            continue
-        score = SequenceMatcher(None, norm_extracted, norm_candidate).ratio()
-        scored.append((candidate, score))
-    scored.sort(key=lambda x: x[1], reverse=True)
-    best_candidate, best_score = scored[0]
-    return best_candidate if best_score >= threshold else extracted_treatment
+        if cand_norm in extracted_norm or extracted_norm in cand_norm:
+            score = 1.0
+        else:
+            score = SequenceMatcher(None, extracted_norm, cand_norm).ratio()
+        if score > best_score:
+            best_score = score
+            best_text = candidate
+    return best_text if best_score >= threshold else extracted
 
 
 def apply_residuo_dictionary_correction(df: pd.DataFrame, catalog: Dict[str, List[str]]) -> pd.DataFrame:
@@ -952,12 +952,14 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
         df["Cantidad (Kg)"] = df["Cantidad (Kg)"].apply(_to_float_kg)
     catalog = load_residuo_catalog()
     df = apply_residuo_dictionary_correction(df, catalog)
-    treatment_level3_catalog = load_treatment_level3_catalog()
     treatment_defra_map = load_treatment_defra_map()
+    treatment_level3_catalog = load_treatment_level3_catalog()
     if "Tratamiento" in df.columns:
         if "Tratamiento Original" not in df.columns:
             df["Tratamiento Original"] = df["Tratamiento"]
-        df["Tratamiento"] = df["Tratamiento"].apply(lambda x: choose_canonical_treatment(x, treatment_level3_catalog))
+        df["Tratamiento"] = df["Tratamiento"].apply(
+            lambda t: choose_canonical_treatment(t, treatment_level3_catalog)
+        )
     if "DEFRA" not in df.columns:
         df["DEFRA"] = ""
     df["DEFRA"] = df.apply(
