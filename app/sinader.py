@@ -2,6 +2,7 @@ import re
 import unicodedata
 import logging
 import os
+import glob
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from difflib import SequenceMatcher
@@ -50,6 +51,7 @@ DEFAULT_TREATMENT_DEFRA_MAP = {
     "vertedero": "Landfill",
     "anaerobic digestion": "Anaerobic digestion",
 }
+DEFAULT_TREATMENT_TRAINING_GLOB = "assets/*output*.xlsx"
 
 
 def _strip_accents(s: str) -> str:
@@ -843,6 +845,41 @@ def choose_canonical_treatment(extracted_treatment: str, known_treatments: List[
     return best_term if best_score >= threshold else raw
 
 
+def load_treatment_alias_map(training_files: Optional[List[str]] = None) -> Dict[str, str]:
+    files = training_files or sorted(glob.glob(DEFAULT_TREATMENT_TRAINING_GLOB))
+    alias_map: Dict[str, str] = {}
+    for file_path in files:
+        try:
+            df = pd.read_excel(file_path)
+        except Exception:
+            continue
+        if df.empty:
+            continue
+        normalized_cols = {_norm(c): c for c in df.columns}
+        extracted_col = None
+        expected_col = None
+        extracted_candidates = ["tratamiento", "tratamiento actual", "tratamiento extraido", "tratamiento extraído"]
+        expected_candidates = ["tratamiento esperado", "esperado tratamiento", "tratamiento objetivo", "tratamiento correcto"]
+        for c in extracted_candidates:
+            if c in normalized_cols:
+                extracted_col = normalized_cols[c]
+                break
+        for c in expected_candidates:
+            if c in normalized_cols:
+                expected_col = normalized_cols[c]
+                break
+        if not extracted_col or not expected_col:
+            continue
+        for _, row in df[[extracted_col, expected_col]].dropna(how="any").iterrows():
+            src = _norm(_clean_cell(row[extracted_col]))
+            dst = _clean_cell(row[expected_col])
+            if src and dst:
+                alias_map[src] = dst
+    if alias_map:
+        logger.info("Mapa de alias de tratamiento cargado desde salidas históricas (%s reglas)", len(alias_map))
+    return alias_map
+
+
 def apply_residuo_dictionary_correction(df: pd.DataFrame, catalog: Dict[str, List[str]]) -> pd.DataFrame:
     if "Descripción Residuo" not in df.columns or "Código principal" not in df.columns:
         return df
@@ -994,10 +1031,13 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
     catalog = load_residuo_catalog()
     df = apply_residuo_dictionary_correction(df, catalog)
     known_treatments = load_treatment_level3_terms()
+    treatment_alias_map = load_treatment_alias_map()
     if "Tratamiento" in df.columns and known_treatments:
         if "Tratamiento Original" not in df.columns:
             df["Tratamiento Original"] = df["Tratamiento"]
-        df["Tratamiento"] = df["Tratamiento"].apply(lambda x: choose_canonical_treatment(x, known_treatments))
+        df["Tratamiento"] = df["Tratamiento"].apply(
+            lambda x: treatment_alias_map.get(_norm(_clean_cell(x)), choose_canonical_treatment(x, known_treatments))
+        )
     treatment_defra_map = load_treatment_defra_map()
     if "DEFRA" not in df.columns:
         df["DEFRA"] = ""
