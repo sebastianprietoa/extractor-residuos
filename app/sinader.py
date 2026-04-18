@@ -417,6 +417,7 @@ def _sanitize_treatment_and_logistics(
     destino: str,
     transportista: str,
     patente: str,
+    cantidad: str = "",
     known_treatments: Optional[List[str]] = None,
 ) -> Tuple[str, str, str, str]:
     def _extract_treatment_phrase(text: str) -> str:
@@ -464,6 +465,30 @@ def _sanitize_treatment_and_logistics(
         def _is_placeholder_destination(value: str) -> bool:
             v = _norm(value)
             return (not v) or v.startswith("in situ") or v.startswith("situ de efluentes")
+
+        def _tail_after_qty_kg(text: str, qty_value: str) -> str:
+            if not text:
+                return ""
+            qty_digits = re.sub(r"\D", "", _clean_cell(qty_value))
+            matches = list(re.finditer(r"(\d[\d\.,]*)\s*kg\b", text, flags=re.IGNORECASE))
+            if not matches:
+                return ""
+            if not qty_digits:
+                return _clean_cell(text[matches[0].end():])
+            for m in matches:
+                m_digits = re.sub(r"\D", "", m.group(1))
+                if m_digits == qty_digits:
+                    return _clean_cell(text[m.end():])
+            return ""
+
+        tail_by_qty = _tail_after_qty_kg(raw_combined, cantidad)
+        if tail_by_qty:
+            phrase_from_tail = _extract_treatment_phrase(tail_by_qty)
+            if phrase_from_tail:
+                trt = phrase_from_tail
+                remainder_tail = _clean_cell(re.sub(re.escape(phrase_from_tail), "", tail_by_qty, count=1, flags=re.IGNORECASE))
+                if remainder_tail and _is_placeholder_destination(dst):
+                    dst = remainder_tail
 
         kg_split = re.search(r"^(?P<prefix>.*?)(?P<qty>\d[\d\.,]*)\s*kg\s*(?P<after>.*)$", trt, flags=re.IGNORECASE)
         if kg_split:
@@ -540,6 +565,7 @@ def extract_sinader_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[
             r.get("Destino", ""),
             r.get("Transportista", ""),
             r.get("Patente", ""),
+            r.get("Cantidad (Kg)", ""),
             known_treatments,
         )
         out_rows.append({
