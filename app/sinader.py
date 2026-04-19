@@ -68,6 +68,20 @@ DESTINATION_NOISE_FRAGMENTS = [
     "planzas, boyas, flotadores, redes y cabos",
     "cenizas del hogar",
     "lodos del tratamiento",
+    "del tratamiento in situ de efluentes",
+    "cartón y productos de papel",
+]
+STRONG_TREATMENT_CATALOG = [
+    "Reciclaje de plásticos",
+    "Reciclaje de metales",
+    "Reciclaje de papel, cartón y productos de papel",
+    "Relleno sanitario",
+    "Monorelleno",
+    "Degradación Anaeróbica",
+    "Compostaje",
+    "Recepción de Lodos en PTAS",
+    "Sitio de Escombros de la Construcción",
+    "Pretratamiento",
 ]
 
 
@@ -323,6 +337,7 @@ def _parse_reconstructed_row_block(
             pat = _clean_cell(m_pat.group(1))
             text = _clean_cell(text[:m_pat.start()])
 
+        treatment_catalog = list(dict.fromkeys(STRONG_TREATMENT_CATALOG + (known_treatments or [])))
         chosen_treatment = ""
         chosen_destination = ""
         text_norm_full = _norm(text)
@@ -332,19 +347,25 @@ def _parse_reconstructed_row_block(
                 text = _clean_cell(re.sub(re.escape(dst), "", text, count=1, flags=re.IGNORECASE))
                 break
 
-        if known_treatments:
+        if treatment_catalog:
             norm_text = _norm(text)
-            for term in sorted(known_treatments, key=lambda x: len(x), reverse=True):
+            for term in sorted(treatment_catalog, key=lambda x: len(x), reverse=True):
                 tnorm = _norm(term)
                 if tnorm and tnorm in norm_text:
                     chosen_treatment = term
                     text = _clean_cell(re.sub(re.escape(term), "", text, count=1, flags=re.IGNORECASE))
                     break
+            if not chosen_treatment:
+                for term in sorted(treatment_catalog, key=lambda x: len(x), reverse=True):
+                    tnorm = _norm(term)
+                    if tnorm and tnorm in text_norm_full:
+                        chosen_treatment = term
+                        break
         text = re.sub(r"\b(destino|transportista|patente|cantidad|residuo|tipo tratamiento)\b", " ", text, flags=re.IGNORECASE)
         text = _clean_cell(re.sub(r"\s+", " ", text))
         dst = chosen_destination or text
-        trt_ok = bool(chosen_treatment) and "cantidad residuo" not in _norm(chosen_treatment)
-        dst_ok = _is_destination_clean(dst, desc_text)
+        trt_ok = bool(chosen_treatment) and _norm(chosen_treatment) in {_norm(x) for x in treatment_catalog}
+        dst_ok = bool(chosen_destination) and _is_destination_clean(dst, desc_text)
         return chosen_treatment, dst, trp, pat, trt_ok, dst_ok
 
     block = _clean_cell(block)
@@ -535,6 +556,11 @@ def _sanitize_treatment_and_logistics(
 
         def _clean_destination_noise(value: str) -> str:
             cleaned = _clean_cell(value)
+            original_norm = _norm(cleaned)
+            for known_dst in sorted(KNOWN_DESTINATIONS, key=lambda x: len(x), reverse=True):
+                kd_norm = _norm(known_dst)
+                if kd_norm and kd_norm in original_norm:
+                    return known_dst
             for frag in DESTINATION_NOISE_FRAGMENTS:
                 cleaned = re.sub(re.escape(frag), " ", cleaned, flags=re.IGNORECASE)
             if descripcion:
@@ -544,6 +570,11 @@ def _sanitize_treatment_and_logistics(
                         continue
                     cleaned = re.sub(rf"\b{re.escape(token)}\b", " ", cleaned, flags=re.IGNORECASE)
             cleaned = _clean_cell(re.sub(r"\s+", " ", cleaned))
+            cleaned_norm = _norm(cleaned)
+            for known_dst in sorted(KNOWN_DESTINATIONS, key=lambda x: len(x), reverse=True):
+                kd_norm = _norm(known_dst)
+                if kd_norm and kd_norm in cleaned_norm:
+                    return known_dst
             return cleaned
 
         def _tail_after_qty_kg(text: str, qty_value: str) -> str:
@@ -1221,6 +1252,8 @@ def _selfcheck_reconstruction_samples() -> Dict[str, bool]:
         "15 01 01 | Envases de papel y cartón 165 kg Reciclaje de papel, cartón y productos de papel ECOFIBRAS SUCURSAL PUERTO MONTT 1|",
         "10 01 01 | Cenizas del hogar 4260 kg Sitio de Escombros de la Construcción ESCOMBRERA TRESOL 1|",
         "20 01 99 | Otras fracciones no especificadas en otra categoría 4210 kg Relleno sanitario CONSORCIO COLLIPULLI 1|",
+        "21 04 04 | Residuos de plásticos (HDPE, PEE, PETE, PVC) excepto planzas, boyas, flotadores, redes y cabos 29756 kg Reciclaje de plásticos PLASTICOS DEL SUR SPA 1|",
+        "02 01 99 | Residuos no especificados en otra categoría 8620 kg Compostaje Centro Crucero 1|",
     ]
     blocks = _reconstruct_row_blocks_from_lines(sample_lines)
     parsed = [_parse_reconstructed_row_block(b, [
@@ -1246,5 +1279,13 @@ def _selfcheck_reconstruction_samples() -> Dict[str, bool]:
             and "ESCOMBRERA TRESOL" in p_by_code.get("10 01 01", {}).get("Destino", "")
             and p_by_code.get("20 01 99", {}).get("Tratamiento") == "Relleno sanitario"
             and "CONSORCIO COLLIPULLI" in p_by_code.get("20 01 99", {}).get("Destino", "")
+            and p_by_code.get("21 04 04", {}).get("Destino") == "PLASTICOS DEL SUR SPA"
+            and _norm(p_by_code.get("02 01 99", {}).get("Destino", "")) == _norm("Centro Crucero")
+        ),
+        "confidence_flags_working": (
+            p_by_code.get("19 08 05", {}).get("Tratamiento_confiable") == "SI"
+            and p_by_code.get("19 08 05", {}).get("Destino_confiable") == "SI"
+            and p_by_code.get("15 01 01", {}).get("Tratamiento_confiable") == "SI"
+            and p_by_code.get("10 01 01", {}).get("Destino_confiable") == "SI"
         ),
     }
