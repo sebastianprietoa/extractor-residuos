@@ -826,14 +826,14 @@ def parse_sinader_table_from_cells(cell_rows, known_treatments: Optional[List[st
     for row_cells in cell_rows:
         if not row_cells:
             continue
-        used = [ _clean_cell(c.get("used", "")) for c in row_cells ]
+        used = [_clean_cell(c.get("used", "")) for c in row_cells]
         # mapeo esperado: Residuo, Cantidad, Tratamiento, Destino, Transportista, Patente
         residuo = used[0] if len(used) > 0 else ""
         cantidad = used[1] if len(used) > 1 else ""
-        tratamiento = used[2] if len(used) > 2 else ""
-        destino = used[3] if len(used) > 3 else ""
-        transportista = used[4] if len(used) > 4 else ""
-        patente = used[5] if len(used) > 5 else ""
+        tratamiento_cell = used[2] if len(used) > 2 else ""
+        destino_cell = used[3] if len(used) > 3 else ""
+        transportista_cell = used[4] if len(used) > 4 else ""
+        patente_cell = used[5] if len(used) > 5 else ""
 
         code, desc = _split_code_and_desc(residuo)
         if not code:
@@ -842,11 +842,41 @@ def parse_sinader_table_from_cells(cell_rows, known_treatments: Optional[List[st
                 code, desc = _clean_cell(m.group(1)), _clean_cell(m.group(2))
         qty_match = re.search(r"(\d[\d\.,]*)", cantidad)
         qty = _clean_cell(qty_match.group(1)) if qty_match else ""
-        synthetic = f"{code} | {desc} {qty} kg {tratamiento} {destino} {transportista} {patente}".strip()
-        parsed = _parse_reconstructed_row_block(synthetic, known_treatments)
-        if parsed:
-            parsed["Texto fila original"] = _clean_cell(" | ".join(used))
-            rows_out.append(parsed)
+
+        trt, dst, trp, pat = _sanitize_treatment_and_logistics(
+            tratamiento_cell,
+            destino_cell,
+            transportista_cell,
+            patente_cell,
+            qty,
+            known_treatments,
+            desc,
+        )
+        treatment_catalog = {_norm(x) for x in (STRONG_TREATMENT_CATALOG + (known_treatments or []))}
+        destination_catalog = {_norm(x) for x in KNOWN_DESTINATIONS}
+        trt_ok = bool(trt) and _norm(trt) in treatment_catalog and not any(_norm(f) in _norm(trt) for f in TREATMENT_NOISE_FRAGMENTS)
+        dst_ok = bool(dst) and (_norm(dst) in destination_catalog or any(k in _norm(dst) for k in destination_catalog if k)) and not any(_norm(f) in _norm(dst) for f in DESTINATION_NOISE_FRAGMENTS)
+        code_ok = bool(re.match(r"^\d{2}\s+\d{2}\s+\d{2}$", _clean_cell(code)))
+        qty_ok = _to_float_kg(qty) is not None
+        parsing_ok = bool(code_ok and qty_ok and (trt_ok or dst_ok))
+
+        if code or desc or qty or trt or dst:
+            rows_out.append({
+                "Código principal": code,
+                "Descripción Residuo": desc,
+                "Cantidad (Kg)": qty,
+                "Tratamiento": trt,
+                "Destino": dst,
+                "Transportista": trp,
+                "Patente": pat,
+                "Peligrosidad": "",
+                "Estado contenedor": "",
+                "Contenedor": "",
+                "Texto fila original": _clean_cell(" | ".join(used)),
+                "Parsing_OK": "SI" if parsing_ok else "NO",
+                "Tratamiento_confiable": "SI" if trt_ok else "NO",
+                "Destino_confiable": "SI" if dst_ok else "NO",
+            })
     return rows_out
 
 
@@ -971,11 +1001,25 @@ def parse_sinader_rows_visual_segmented(pdf_path: str) -> List[Dict[str, str]]:
             row_debug_texts: List[Dict[str, str]] = []
             parsed_rows = []
             cell_debug_rows: List[List[Dict[str, str]]] = []
+            accepted_cell_rows = 0
+            rejected_cell_rows = 0
             if column_bounds and len(column_bounds) >= 7:
                 row_cells = build_cell_bboxes(row_boxes, column_bounds)
                 cell_rows = extract_text_from_cell_bboxes(page, img_bgr, row_cells, scale_x, scale_y, page_is_pdfplumber=(doc is None))
                 cell_debug_rows = cell_rows
-                parsed_rows = parse_sinader_table_from_cells(cell_rows, known_treatments)
+                parsed_from_cells = parse_sinader_table_from_cells(cell_rows, known_treatments)
+                # Criterio de aceptación: código + cantidad + texto razonable en columnas principales
+                for r in parsed_from_cells:
+                    code_ok = bool(re.match(r"^\d{2}\s+\d{2}\s+\d{2}$", _clean_cell(r.get("Código principal", ""))))
+                    qty_ok = _to_float_kg(r.get("Cantidad (Kg)", "")) is not None
+                    trt_txt = _clean_cell(r.get("Tratamiento", ""))
+                    dst_txt = _clean_cell(r.get("Destino", ""))
+                    if code_ok and qty_ok and (trt_txt or dst_txt):
+                        r["Row_strategy"] = "cells_primary"
+                        parsed_rows.append(r)
+                        accepted_cell_rows += 1
+                    else:
+                        rejected_cell_rows += 1
             if not parsed_rows:
                 for bbox_img in row_boxes:
                     text_native = extract_pdf_text_from_bbox(page, bbox_img, scale_x, scale_y, page_is_pdfplumber=(doc is None))
@@ -989,6 +1033,7 @@ def parse_sinader_rows_visual_segmented(pdf_path: str) -> List[Dict[str, str]]:
                     parsed = _parse_reconstructed_row_block(text_used, known_treatments)
                     if parsed:
                         parsed["Texto fila original"] = text_used
+                        parsed["Row_strategy"] = "row_visual_fallback"
                         parsed_rows.append(parsed)
             rows_out.extend(parsed_rows)
             if debug_dir is not None:
@@ -1002,6 +1047,12 @@ def parse_sinader_rows_visual_segmented(pdf_path: str) -> List[Dict[str, str]]:
                     column_bounds=column_bounds,
                     cell_rows=cell_debug_rows,
                 )
+                page_extra = {
+                    "cells_accepted": accepted_cell_rows,
+                    "cells_rejected": rejected_cell_rows,
+                    "rows_final": len(parsed_rows),
+                }
+                (debug_dir / f"page_{page_index+1:02d}_row_strategy.json").write_text(json.dumps(page_extra, ensure_ascii=False, indent=2), encoding="utf-8")
     finally:
         if doc is not None:
             doc.close()
