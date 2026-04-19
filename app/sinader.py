@@ -2162,10 +2162,62 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
     df["DEFRA_confiable"] = df["DEFRA_source"].apply(
         lambda x: "SI" if _clean_cell(x) in {"heredada_base", "ajustada_tratamiento", "ajustada_regla_codigo"} else "NO"
     )
+    df_v2 = pd.DataFrame({
+        "archivo": df.get("FuentePDF", pd.Series(dtype=str)).fillna("").astype(str),
+        "folio": df.get("Folio", pd.Series(dtype=str)).fillna(""),
+        "establecimiento": df.get("Establecimiento", pd.Series(dtype=str)).fillna(""),
+        "periodo_declarado": df.get("Periodo declarado", pd.Series(dtype=str)).fillna(""),
+        "fecha_declaracion": "",
+        "sin_movimientos": df.get("Sin movimientos", pd.Series(dtype=str)).fillna("").astype(str).str.upper().map(
+            {"SI": True, "TRUE": True, "YES": True, "NO": False, "FALSE": False}
+        ),
+        "codigo_residuo": df.get("Código principal", pd.Series(dtype=str)).fillna(""),
+        "residuo": df.get("Descripción Residuo", pd.Series(dtype=str)).fillna(""),
+        "cantidad_kg": df.get("Cantidad (Kg)", pd.Series(dtype=float)).astype("float64"),
+        "tratamiento": df.get("Tratamiento", pd.Series(dtype=str)).fillna(""),
+        "metodo_usado": df.get("Row_strategy", pd.Series(dtype=str)).fillna(""),
+        "requiere_revision": (
+            (df.get("Parsing_OK", pd.Series(dtype=str)).fillna("NO").astype(str).str.upper() != "SI")
+            | (df.get("Tratamiento", pd.Series(dtype=str)).fillna("").astype(str).str.strip() == "")
+        ),
+        "observacion": "",
+        "fila_original": df.get("Texto fila original", pd.Series(dtype=str)).fillna(""),
+    })
+    df_v2["residuo_extraido"] = df.get("Descripción Residuo Original", df_v2["residuo"]).fillna(df_v2["residuo"])
+    catalog_for_map = load_residuo_catalog() or MASTER_RESIDUOS
+    residuo_map = {k: (v[0] if isinstance(v, list) and v else "") for k, v in catalog_for_map.items()}
+    df_v2["residuo_oficial"] = df_v2["codigo_residuo"].map(lambda x: residuo_map.get(_normalize_code(x), ""))
+    df_v2["residuo"] = df_v2["residuo_oficial"].where(df_v2["residuo_oficial"].astype(str).str.strip() != "", df_v2["residuo"])
+    df_v2["codigo_sin_mapa_residuo"] = (
+        df_v2["codigo_residuo"].astype(str).str.strip() != ""
+    ) & (df_v2["residuo_oficial"].astype(str).str.strip() == "")
+    df_v2["requiere_revision"] = (
+        df_v2["requiere_revision"]
+        | df_v2["codigo_sin_mapa_residuo"]
+        | df_v2["observacion"].astype(str).str.strip().ne("")
+    )
+    df_v2["sin_movimientos"] = df_v2["sin_movimientos"].where(df_v2["sin_movimientos"].notna(), False)
+    export_cols = [
+        "archivo", "folio", "establecimiento", "periodo_declarado", "fecha_declaracion",
+        "sin_movimientos", "codigo_residuo", "residuo", "residuo_extraido", "residuo_oficial",
+        "cantidad_kg", "tratamiento", "metodo_usado", "requiere_revision", "codigo_sin_mapa_residuo",
+        "observacion", "fila_original",
+    ]
+    df_v2 = df_v2[export_cols]
+    df_ok = df_v2[(df_v2["sin_movimientos"] == False) & (df_v2["codigo_residuo"].astype(str).str.strip() != "")].copy()
+    df_revision = df_v2[
+        (df_v2["observacion"].astype(str).str.strip() != "")
+        | (df_v2["tratamiento"].astype(str).str.strip() == "")
+        | (df_v2["requiere_revision"] == True)
+        | (df_v2["codigo_sin_mapa_residuo"] == True)
+    ].copy()
     Path(output_excel).parent.mkdir(parents=True, exist_ok=True)
-    df.to_excel(output_excel, index=False)
-    logger.info("Excel generado: %s | filas=%s", output_excel, len(df))
-    return df
+    with pd.ExcelWriter(output_excel, engine="openpyxl") as writer:
+        df_v2.to_excel(writer, sheet_name="Completo", index=False)
+        df_ok.to_excel(writer, sheet_name="OK", index=False)
+        df_revision.to_excel(writer, sheet_name="Revision", index=False)
+    logger.info("Excel generado: %s | filas=%s", output_excel, len(df_v2))
+    return df_v2
 
 
 def summarize_parsing_quality(df: pd.DataFrame, known_treatments: Optional[List[str]] = None) -> Dict[str, int]:
