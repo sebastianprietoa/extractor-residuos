@@ -3,12 +3,16 @@ import unicodedata
 import logging
 import os
 import glob
+import importlib
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from difflib import SequenceMatcher
 
 import pandas as pd
 import pdfplumber
+
+_pytesseract_spec = importlib.util.find_spec("pytesseract")
+pytesseract = importlib.import_module("pytesseract") if _pytesseract_spec else None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -560,6 +564,99 @@ def parse_sinader_rows_from_text(full_text: str) -> List[Dict[str, str]]:
     return list(uniq.values())
 
 
+def _build_visual_lines_from_words(words: List[Dict], y_tolerance: float = 3.0) -> List[Tuple[float, str]]:
+    if not words:
+        return []
+    sorted_words = sorted(words, key=lambda w: (float(w.get("top", 0)), float(w.get("x0", 0))))
+    lines: List[Tuple[float, List[Dict]]] = []
+    for w in sorted_words:
+        w_top = float(w.get("top", 0))
+        if not lines:
+            lines.append((w_top, [w]))
+            continue
+        last_top, last_words = lines[-1]
+        if abs(w_top - last_top) <= y_tolerance:
+            last_words.append(w)
+            new_top = (last_top * (len(last_words) - 1) + w_top) / len(last_words)
+            lines[-1] = (new_top, last_words)
+        else:
+            lines.append((w_top, [w]))
+    out: List[Tuple[float, str]] = []
+    for y, line_words in lines:
+        ordered = sorted(line_words, key=lambda ww: float(ww.get("x0", 0)))
+        text = _clean_cell(" ".join(_clean_cell(ww.get("text", "")) for ww in ordered))
+        if text:
+            out.append((y, text))
+    return out
+
+
+def _reconstruct_row_blocks_from_visual_lines(lines: List[Tuple[float, str]]) -> List[Tuple[Tuple[float, float], str]]:
+    blocks: List[Tuple[Tuple[float, float], str]] = []
+    current_text: List[str] = []
+    y_start = None
+    y_end = None
+    ler_start = re.compile(r"^\s*\d{2}\s+\d{2}\s+\d{2}\b")
+    header_seen = False
+    for y, text in lines:
+        norm_line = _norm(text)
+        if not header_seen and ("residuo" in norm_line and "cantidad" in norm_line and "destino" in norm_line):
+            header_seen = True
+            continue
+        if not header_seen:
+            continue
+        if ler_start.match(text):
+            if current_text:
+                blocks.append(((float(y_start or 0), float(y_end or 0)), _clean_cell(" ".join(current_text))))
+            current_text = [text]
+            y_start = y
+            y_end = y
+        elif current_text:
+            current_text.append(text)
+            y_end = y
+    if current_text:
+        blocks.append(((float(y_start or 0), float(y_end or 0)), _clean_cell(" ".join(current_text))))
+    return blocks
+
+
+def _ocr_row_region_if_needed(page, y0: float, y1: float) -> str:
+    if pytesseract is None:
+        return ""
+    try:
+        crop = page.within_bbox((0, max(0, y0 - 2), page.width, min(page.height, y1 + 2)))
+        im = crop.to_image(resolution=220).original
+        text = pytesseract.image_to_string(im, lang="spa+eng")
+        return _clean_cell(text)
+    except Exception:
+        return ""
+
+
+def parse_sinader_rows_hybrid(pdf_path: str) -> List[Dict[str, str]]:
+    rows_out: List[Dict[str, str]] = []
+    known_treatments = load_treatment_level3_terms()
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            try:
+                words = page.extract_words(use_text_flow=True, keep_blank_chars=False) or []
+            except Exception:
+                words = page.extract_words() or []
+            lines = _build_visual_lines_from_words(words)
+            blocks = _reconstruct_row_blocks_from_visual_lines(lines)
+            for (y0, y1), block_text in blocks:
+                text_to_parse = block_text
+                if len(block_text) < 25:
+                    ocr_text = _ocr_row_region_if_needed(page, y0, y1)
+                    if ocr_text:
+                        text_to_parse = ocr_text
+                parsed = _parse_reconstructed_row_block(text_to_parse, known_treatments)
+                if parsed:
+                    rows_out.append(parsed)
+    uniq = {}
+    for r in rows_out:
+        key = (r.get("Código principal", ""), _norm(r.get("Descripción Residuo", "")), _clean_cell(r.get("Cantidad (Kg)", "")))
+        uniq.setdefault(key, r)
+    return list(uniq.values())
+
+
 def extract_global_treatment_from_text(full_text: str, known_treatments: Optional[List[str]] = None) -> str:
     text = _cell_join_multiline(full_text or "")
     if not text:
@@ -810,17 +907,15 @@ def extract_sinader_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[
         }], meta
     rows_from_tables = parse_sinader_rows_from_tables(pdf_path)
     rows_from_text = parse_sinader_rows_from_text(full_text)
+    rows_from_hybrid = parse_sinader_rows_hybrid(pdf_path)
 
     def _score_rows(rows: List[Dict[str, str]]) -> tuple[int, int, int]:
         valid_core = sum(1 for r in rows if _clean_cell(r.get("Código principal", "")) and _clean_cell(r.get("Cantidad (Kg)", "")))
         with_treatment = sum(1 for r in rows if _clean_cell(r.get("Tratamiento", "")))
         return (valid_core, with_treatment, len(rows))
 
-    detail_rows = rows_from_tables
-    if not rows_from_tables and rows_from_text:
-        detail_rows = rows_from_text
-    elif rows_from_tables and rows_from_text:
-        detail_rows = rows_from_text if _score_rows(rows_from_text) > _score_rows(rows_from_tables) else rows_from_tables
+    candidates = [rows_from_tables, rows_from_text, rows_from_hybrid]
+    detail_rows = max(candidates, key=_score_rows)
 
     known_treatments = load_treatment_level3_terms()
     global_treatment = extract_global_treatment_from_text(full_text, known_treatments)
