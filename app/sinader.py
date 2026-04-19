@@ -70,6 +70,10 @@ KNOWN_DESTINATIONS = [
     "PLANTA RILESUR",
     "ESTACIÓN DE TRANSFERENCIA",
     "ESTACION DE TRANSFERENCIA",
+    "ECOFIBRAS SUCURSAL CORONEL",
+    "ECOBIO",
+    "CANCHA COMPOSTAJE LOS REBALSES DEL SUR",
+    "CANCHA LOS REBALSES DEL SUR",
 ]
 DESTINATION_NOISE_FRAGMENTS = [
     "en otra categoría",
@@ -78,6 +82,13 @@ DESTINATION_NOISE_FRAGMENTS = [
     "lodos del tratamiento",
     "del tratamiento in situ de efluentes",
     "cartón y productos de papel",
+]
+TREATMENT_NOISE_FRAGMENTS = [
+    "en otra categoría",
+    "especificadas en otra categoría",
+    "planzas, boyas, flotadores, redes y cabos",
+    "cenizas del hogar",
+    "lodos del tratamiento in situ de efluentes",
 ]
 STRONG_TREATMENT_CATALOG = [
     "Reciclaje de plásticos",
@@ -93,6 +104,7 @@ STRONG_TREATMENT_CATALOG = [
     "Pretratamiento de plásticos",
     "Reciclaje de residuos hidrobiológicos para consumo animal",
     "Residuos municipales asimilables a domiciliarios",
+    "Disposición final",
 ]
 KNOWN_SINADER_CODES = {
     "15 01 01", "15 01 02", "15 01 04", "20 01 99", "19 08 05", "10 01 01", "21 04 04", "02 02 04",
@@ -328,6 +340,16 @@ def _parse_reconstructed_row_block(
     block: str,
     known_treatments: Optional[List[str]] = None,
 ) -> Optional[Dict[str, str]]:
+    def _find_catalog_match_spans(text: str, catalog: List[str]) -> List[Tuple[int, int, str]]:
+        spans: List[Tuple[int, int, str]] = []
+        for term in sorted(set(catalog), key=lambda x: len(x), reverse=True):
+            if not _clean_cell(term):
+                continue
+            m = re.search(re.escape(term), text, flags=re.IGNORECASE)
+            if m:
+                spans.append((m.start(), m.end(), term))
+        return spans
+
     def _is_destination_clean(dst_text: str, desc_text: str) -> bool:
         d = _norm(dst_text)
         if not d:
@@ -336,9 +358,28 @@ def _parse_reconstructed_row_block(
             return False
         dn = _norm(desc_text)
         if dn:
+            generic_tokens = {
+                "residuos", "residuo", "plastico", "plasticos", "plástico", "plásticos", "envases", "organicos",
+                "orgánicos", "tratamiento", "lodos", "subproductos", "fracciones", "especificadas",
+            }
             for token in [t for t in dn.split() if len(t) >= 6]:
+                if token in generic_tokens:
+                    continue
                 if token in d and token not in {"puerto", "tratamiento"}:
                     return False
+        return True
+
+    def _is_treatment_clean(treatment_text: str, desc_text: str) -> bool:
+        t = _norm(treatment_text)
+        if not t:
+            return False
+        if any(_norm(x) in t for x in TREATMENT_NOISE_FRAGMENTS):
+            return False
+        dn = _norm(desc_text)
+        if dn:
+            long_tokens = [tok for tok in dn.split() if len(tok) >= 8]
+            if long_tokens and sum(1 for tok in long_tokens if tok in t) >= 2:
+                return False
         return True
 
     def _parse_tail_right_to_left(tail: str, desc_text: str) -> Tuple[str, str, str, str, bool, bool]:
@@ -347,39 +388,55 @@ def _parse_reconstructed_row_block(
             return "", "", "", "", False, False
         pat = ""
         trp = ""
-        m_pat = re.search(r"(\d+\|)\s*$", text)
-        if m_pat:
-            pat = _clean_cell(m_pat.group(1))
-            text = _clean_cell(text[:m_pat.start()])
+        m_marker = re.search(r"\b\d+\|\s*$", text)
+        if m_marker:
+            text = _clean_cell(text[:m_marker.start()])
+        m_plate = re.search(r"\b((?=[A-Z0-9-]*\d)(?:[A-Z]{2,4}-[A-Z0-9]{2,4}|[A-Z]{2,4}[0-9]{2,4}))\b\s*$", text)
+        if m_plate:
+            candidate_plate = _clean_cell(m_plate.group(1)).replace(" ", "-")
+            if not re.fullmatch(r"\d+\|?", candidate_plate):
+                pat = candidate_plate
+                text = _clean_cell(text[:m_plate.start()])
 
         treatment_catalog = list(dict.fromkeys(STRONG_TREATMENT_CATALOG + (known_treatments or [])))
         chosen_treatment = ""
         chosen_destination = ""
-        text_norm_full = _norm(text)
-        for dst in sorted(KNOWN_DESTINATIONS, key=lambda x: len(x), reverse=True):
-            if _norm(dst) in text_norm_full:
-                chosen_destination = dst
-                text = _clean_cell(re.sub(re.escape(dst), "", text, count=1, flags=re.IGNORECASE))
-                break
+        destination_spans = _find_catalog_match_spans(text, KNOWN_DESTINATIONS)
+        treatment_spans = _find_catalog_match_spans(text, treatment_catalog) if treatment_catalog else []
+        best_pair: Optional[Tuple[Tuple[int, int, str], Tuple[int, int, str]]] = None
+        best_pair_score = -1
+        for t_span in treatment_spans:
+            for d_span in destination_spans:
+                overlap = not (t_span[1] <= d_span[0] or d_span[1] <= t_span[0])
+                if overlap:
+                    continue
+                score = (t_span[1] - t_span[0]) + (d_span[1] - d_span[0])
+                if t_span[0] <= d_span[0]:
+                    score += 5
+                if score > best_pair_score:
+                    best_pair_score = score
+                    best_pair = (t_span, d_span)
 
-        if treatment_catalog:
-            norm_text = _norm(text)
-            for term in sorted(treatment_catalog, key=lambda x: len(x), reverse=True):
-                tnorm = _norm(term)
-                if tnorm and tnorm in norm_text:
-                    chosen_treatment = term
-                    text = _clean_cell(re.sub(re.escape(term), "", text, count=1, flags=re.IGNORECASE))
-                    break
-            if not chosen_treatment:
-                for term in sorted(treatment_catalog, key=lambda x: len(x), reverse=True):
-                    tnorm = _norm(term)
-                    if tnorm and tnorm in text_norm_full:
-                        chosen_treatment = term
-                        break
+        if best_pair:
+            t_span, d_span = best_pair
+            chosen_treatment = t_span[2]
+            chosen_destination = d_span[2]
+            for span in sorted([t_span, d_span], key=lambda x: x[0], reverse=True):
+                text = _clean_cell(text[:span[0]] + " " + text[span[1]:])
+        else:
+            if destination_spans:
+                d_span = destination_spans[0]
+                chosen_destination = d_span[2]
+                text = _clean_cell(text[:d_span[0]] + " " + text[d_span[1]:])
+            if treatment_spans:
+                t_span = treatment_spans[0]
+                chosen_treatment = t_span[2]
+                text = _clean_cell(text[:t_span[0]] + " " + text[t_span[1]:])
+
         text = re.sub(r"\b(destino|transportista|patente|cantidad|residuo|tipo tratamiento)\b", " ", text, flags=re.IGNORECASE)
         text = _clean_cell(re.sub(r"\s+", " ", text))
         dst = chosen_destination or text
-        trt_ok = bool(chosen_treatment) and _norm(chosen_treatment) in {_norm(x) for x in treatment_catalog}
+        trt_ok = bool(chosen_treatment) and _norm(chosen_treatment) in {_norm(x) for x in treatment_catalog} and _is_treatment_clean(chosen_treatment, desc_text)
         dst_ok = bool(chosen_destination) and _is_destination_clean(dst, desc_text)
         return chosen_treatment, dst, trp, pat, trt_ok, dst_ok
 
@@ -422,7 +479,10 @@ def _parse_reconstructed_row_block(
         known_treatments,
         desc,
     )
-    parsing_ok = bool(code and desc and qty and (trt_ok or dst_ok))
+    qty_ok = _to_float_kg(qty) is not None
+    code_ok = bool(code and re.match(r"^\d{2}\s+\d{2}\s+\d{2}$", code))
+    semantic_ok = (trt_ok or dst_ok) and _is_destination_clean(dst, desc) and (not trt or _is_treatment_clean(trt, desc))
+    parsing_ok = bool(code_ok and desc and qty_ok and semantic_ok)
     return {
         "Código principal": code,
         "Descripción Residuo": desc,
@@ -665,15 +725,10 @@ def _sanitize_treatment_and_logistics(
             cleaned = re.sub(r"\d[\d\.,]*\s*kg\b", " ", cleaned, flags=re.IGNORECASE)
             cleaned = re.sub(r"\b(destino|transportista|patente)\b", " ", cleaned, flags=re.IGNORECASE)
             cleaned = re.sub(r"\bin\s*situ\s*de\s*efluentes\b", " ", cleaned, flags=re.IGNORECASE)
-            if not trp and not pat:
-                m_trp = re.search(r"\b(\d+)\|?\b", cleaned)
-                if m_trp:
-                    trp = f"{m_trp.group(1)}|"
-                    cleaned = cleaned.replace(m_trp.group(0), " ")
             cleaned = re.sub(r"\d+\|", " ", cleaned)
             cleaned = re.sub(r"\b\d+\b", " ", cleaned)
             if not pat:
-                m_pat = re.search(r"\b([A-Z]{2,4}-[A-Z0-9]{2,4})\b", cleaned)
+                m_pat = re.search(r"\b((?=[A-Z0-9-]*\d)(?:[A-Z]{2,4}-[A-Z0-9]{2,4}|[A-Z]{2,4}[0-9]{2,4}))\b", cleaned)
                 if m_pat:
                     pat = m_pat.group(1)
                     cleaned = cleaned.replace(m_pat.group(1), " ")
@@ -1257,6 +1312,45 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
     return df
 
 
+def summarize_parsing_quality(df: pd.DataFrame, known_treatments: Optional[List[str]] = None) -> Dict[str, int]:
+    if df is None or df.empty:
+        return {
+            "rows_total": 0,
+            "rows_parsing_no": 0,
+            "rows_destino_contaminado": 0,
+            "rows_tratamiento_fuera_catalogo": 0,
+        }
+    known_treatments = known_treatments or load_treatment_level3_terms() or STRONG_TREATMENT_CATALOG
+    known_treatment_norm = {_norm(t) for t in known_treatments if _clean_cell(t)}
+    forbidden_dst = [_norm(x) for x in DESTINATION_NOISE_FRAGMENTS]
+    forbidden_trt = [_norm(x) for x in TREATMENT_NOISE_FRAGMENTS]
+
+    def _dst_contaminated(row: pd.Series) -> bool:
+        dst = _norm(_clean_cell(row.get("Destino", "")))
+        if not dst:
+            return False
+        if any(f and f in dst for f in forbidden_dst):
+            return True
+        desc = _norm(_clean_cell(row.get("Descripción Residuo", "")))
+        desc_tokens = [tok for tok in desc.split() if len(tok) >= 8]
+        return sum(1 for tok in desc_tokens if tok in dst) >= 2
+
+    def _trt_outside_catalog(row: pd.Series) -> bool:
+        trt = _norm(_clean_cell(row.get("Tratamiento", "")))
+        if not trt:
+            return False
+        if any(f and f in trt for f in forbidden_trt):
+            return True
+        return trt not in known_treatment_norm
+
+    return {
+        "rows_total": int(len(df)),
+        "rows_parsing_no": int((df.get("Parsing_OK", pd.Series(dtype=str)).fillna("NO").astype(str).str.upper() != "SI").sum()),
+        "rows_destino_contaminado": int(df.apply(_dst_contaminated, axis=1).sum()),
+        "rows_tratamiento_fuera_catalogo": int(df.apply(_trt_outside_catalog, axis=1).sum()),
+    }
+
+
 def _selfcheck_reconstruction_samples() -> Dict[str, bool]:
     sample_lines = [
         "Residuo Cantidad (kg) Tipo Tratamiento Destino Transportista Patente",
@@ -1269,15 +1363,14 @@ def _selfcheck_reconstruction_samples() -> Dict[str, bool]:
         "20 01 99 | Otras fracciones no especificadas en otra categoría 4210 kg Relleno sanitario CONSORCIO COLLIPULLI 1|",
         "21 04 04 | Residuos de plásticos (HDPE, PEE, PETE, PVC) excepto planzas, boyas, flotadores, redes y cabos 29756 kg Reciclaje de plásticos PLASTICOS DEL SUR SPA 1|",
         "02 01 99 | Residuos no especificados en otra categoría 8620 kg Compostaje Centro Crucero 1|",
+        "02 02 03 | Subproductos hidrobiológicos 9000 kg Reciclaje de residuos hidrobiológicos para consumo animal SALMONOIL S.A. 1|",
+        "20 01 39 | Plásticos mixtos 1450 kg Pretratamiento de plásticos REPLACAR 1|",
+        "15 01 06 | Residuos mixtos 3400 kg Residuos municipales asimilables a domiciliarios Estación de transferencia 1|",
+        "15 01 06 | Residuos mixtos 900 kg Disposición final ECOBIO 1|",
+        "21 07 09 | Biosólidos 700 kg Compostaje Cancha compostaje Los Rebalses del Sur 1|",
     ]
     blocks = _reconstruct_row_blocks_from_lines(sample_lines)
-    parsed = [_parse_reconstructed_row_block(b, [
-        "Degradación Anaeróbica",
-        "Relleno sanitario",
-        "Sitio de Escombros de la Construcción",
-        "Reciclaje de papel, cartón y productos de papel",
-        "Recepción de Lodos en PTAS",
-    ]) for b in blocks]
+    parsed = [_parse_reconstructed_row_block(b, STRONG_TREATMENT_CATALOG) for b in blocks]
     parsed = [p for p in parsed if p]
     p_by_code = {p["Código principal"]: p for p in parsed}
     return {
@@ -1296,6 +1389,13 @@ def _selfcheck_reconstruction_samples() -> Dict[str, bool]:
             and "CONSORCIO COLLIPULLI" in p_by_code.get("20 01 99", {}).get("Destino", "")
             and p_by_code.get("21 04 04", {}).get("Destino") == "PLASTICOS DEL SUR SPA"
             and _norm(p_by_code.get("02 01 99", {}).get("Destino", "")) == _norm("Centro Crucero")
+            and p_by_code.get("02 02 03", {}).get("Tratamiento") == "Reciclaje de residuos hidrobiológicos para consumo animal"
+            and p_by_code.get("20 01 39", {}).get("Destino") == "REPLACAR"
+            and _norm(p_by_code.get("15 01 06", {}).get("Destino", "")) in {_norm("Estación de transferencia"), _norm("ECOBIO")}
+            and _norm(p_by_code.get("21 07 09", {}).get("Destino", "")) in {
+                _norm("CANCHA COMPOSTAJE LOS REBALSES DEL SUR"),
+                _norm("CANCHA LOS REBALSES DEL SUR"),
+            }
         ),
         "confidence_flags_working": (
             p_by_code.get("19 08 05", {}).get("Tratamiento_confiable") == "SI"
