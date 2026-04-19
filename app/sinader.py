@@ -13,6 +13,12 @@ import pdfplumber
 
 _pytesseract_spec = importlib.util.find_spec("pytesseract")
 pytesseract = importlib.import_module("pytesseract") if _pytesseract_spec else None
+_fitz_spec = importlib.util.find_spec("fitz")
+fitz = importlib.import_module("fitz") if _fitz_spec else None
+_cv2_spec = importlib.util.find_spec("cv2")
+cv2 = importlib.import_module("cv2") if _cv2_spec else None
+_np_spec = importlib.util.find_spec("numpy")
+np = importlib.import_module("numpy") if _np_spec else None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -564,97 +570,174 @@ def parse_sinader_rows_from_text(full_text: str) -> List[Dict[str, str]]:
     return list(uniq.values())
 
 
-def _build_visual_lines_from_words(words: List[Dict], y_tolerance: float = 3.0) -> List[Tuple[float, str]]:
-    if not words:
+def render_pdf_page_to_image(doc, page_index: int, dpi: int = 220):
+    if fitz is None or np is None:
+        return None
+    zoom = dpi / 72.0
+    page = doc.load_page(page_index)
+    matrix = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=matrix, alpha=False)
+    buffer = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.height, pix.width, pix.n))
+    if pix.n == 3:
+        img_bgr = buffer[:, :, ::-1].copy()
+    else:
+        img_bgr = cv2.cvtColor(buffer, cv2.COLOR_RGBA2BGR) if cv2 is not None else buffer[:, :, :3].copy()
+    scale_x = pix.width / float(page.rect.width)
+    scale_y = pix.height / float(page.rect.height)
+    return img_bgr, page.rect.width, page.rect.height, scale_x, scale_y
+
+
+def detect_table_bbox_from_image(img_bgr):
+    if cv2 is None or np is None or img_bgr is None:
+        return None
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    th = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 15)
+    h, w = th.shape[:2]
+    kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (max(20, w // 35), 1))
+    kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(12, h // 60)))
+    horiz = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel_h)
+    vert = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel_v)
+    table_map = cv2.bitwise_or(horiz, vert)
+    contours, _ = cv2.findContours(table_map, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best = None
+    best_area = 0
+    for cnt in contours:
+        x, y, ww, hh = cv2.boundingRect(cnt)
+        area = ww * hh
+        if ww < int(w * 0.55) or hh < int(h * 0.12):
+            continue
+        if area > best_area:
+            best_area = area
+            best = (x, y, x + ww, y + hh)
+    if best:
+        return best
+    # fallback: banda con mayor densidad de tinta (evita fallar cuando no hay líneas de tabla)
+    row_density = np.sum(th > 0, axis=1)
+    active = np.where(row_density > np.percentile(row_density, 70))[0]
+    if active.size == 0:
+        return None
+    y0 = max(0, int(active.min()) - 10)
+    y1 = min(h - 1, int(active.max()) + 10)
+    return (0, y0, w - 1, y1)
+
+
+def segment_row_bboxes_from_image(img_bgr, table_bbox):
+    if cv2 is None or np is None or img_bgr is None or table_bbox is None:
         return []
-    sorted_words = sorted(words, key=lambda w: (float(w.get("top", 0)), float(w.get("x0", 0))))
-    lines: List[Tuple[float, List[Dict]]] = []
-    for w in sorted_words:
-        w_top = float(w.get("top", 0))
-        if not lines:
-            lines.append((w_top, [w]))
+    x0, y0, x1, y1 = table_bbox
+    roi = img_bgr[y0:y1, x0:x1]
+    if roi.size == 0:
+        return []
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 31, 11)
+    # une caracteres por línea
+    line_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(15, (x1 - x0) // 40), 2))
+    connected = cv2.morphologyEx(th, cv2.MORPH_CLOSE, line_kernel)
+    row_proj = np.sum(connected > 0, axis=1)
+    threshold = max(2, int((x1 - x0) * 0.015))
+    active = row_proj > threshold
+    spans: List[Tuple[int, int]] = []
+    start = None
+    for i, on in enumerate(active):
+        if on and start is None:
+            start = i
+        elif not on and start is not None:
+            spans.append((start, i - 1))
+            start = None
+    if start is not None:
+        spans.append((start, len(active) - 1))
+    # merge gaps cortos para mantener filas multilínea juntas
+    merged: List[Tuple[int, int]] = []
+    for s, e in spans:
+        if not merged:
+            merged.append((s, e))
             continue
-        last_top, last_words = lines[-1]
-        if abs(w_top - last_top) <= y_tolerance:
-            last_words.append(w)
-            new_top = (last_top * (len(last_words) - 1) + w_top) / len(last_words)
-            lines[-1] = (new_top, last_words)
+        ps, pe = merged[-1]
+        if s - pe <= 7:
+            merged[-1] = (ps, e)
         else:
-            lines.append((w_top, [w]))
-    out: List[Tuple[float, str]] = []
-    for y, line_words in lines:
-        ordered = sorted(line_words, key=lambda ww: float(ww.get("x0", 0)))
-        text = _clean_cell(" ".join(_clean_cell(ww.get("text", "")) for ww in ordered))
-        if text:
-            out.append((y, text))
-    return out
-
-
-def _reconstruct_row_blocks_from_visual_lines(lines: List[Tuple[float, str]]) -> List[Tuple[Tuple[float, float], str]]:
-    blocks: List[Tuple[Tuple[float, float], str]] = []
-    current_text: List[str] = []
-    y_start = None
-    y_end = None
-    ler_start = re.compile(r"^\s*\d{2}\s+\d{2}\s+\d{2}\b")
-    header_seen = False
-    for y, text in lines:
-        norm_line = _norm(text)
-        if not header_seen and ("residuo" in norm_line and "cantidad" in norm_line and "destino" in norm_line):
-            header_seen = True
+            merged.append((s, e))
+    row_boxes = []
+    min_h = max(8, int((y1 - y0) * 0.012))
+    for s, e in merged:
+        if (e - s + 1) < min_h:
             continue
-        if not header_seen:
-            continue
-        if ler_start.match(text):
-            if current_text:
-                blocks.append(((float(y_start or 0), float(y_end or 0)), _clean_cell(" ".join(current_text))))
-            current_text = [text]
-            y_start = y
-            y_end = y
-        elif current_text:
-            current_text.append(text)
-            y_end = y
-    if current_text:
-        blocks.append(((float(y_start or 0), float(y_end or 0)), _clean_cell(" ".join(current_text))))
-    return blocks
+        row_boxes.append((x0, y0 + max(0, s - 2), x1, y0 + min((y1 - y0) - 1, e + 2)))
+    return row_boxes
 
 
-def _ocr_row_region_if_needed(page, y0: float, y1: float) -> str:
-    if pytesseract is None:
+def extract_pdf_text_from_bbox(page, bbox_img, scale_x: float, scale_y: float) -> str:
+    x0i, y0i, x1i, y1i = bbox_img
+    x0 = max(0.0, x0i / scale_x)
+    y0 = max(0.0, y0i / scale_y)
+    x1 = min(page.rect.width, x1i / scale_x)
+    y1 = min(page.rect.height, y1i / scale_y)
+    rect = fitz.Rect(x0, y0, x1, y1)
+    text = page.get_text("text", clip=rect) if fitz is not None else ""
+    return _clean_cell(text)
+
+
+def ocr_text_from_bbox(img_bgr, bbox_img) -> str:
+    if pytesseract is None or cv2 is None or img_bgr is None:
         return ""
-    try:
-        crop = page.within_bbox((0, max(0, y0 - 2), page.width, min(page.height, y1 + 2)))
-        im = crop.to_image(resolution=220).original
-        text = pytesseract.image_to_string(im, lang="spa+eng")
-        return _clean_cell(text)
-    except Exception:
+    x0, y0, x1, y1 = bbox_img
+    crop = img_bgr[max(0, y0):max(0, y1), max(0, x0):max(0, x1)]
+    if crop.size == 0:
         return ""
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    txt = pytesseract.image_to_string(gray, lang="spa+eng")
+    return _clean_cell(txt)
 
 
-def parse_sinader_rows_hybrid(pdf_path: str) -> List[Dict[str, str]]:
+def _row_text_is_incoherent(text: str) -> bool:
+    t = _clean_cell(text)
+    if len(t) < 18:
+        return True
+    has_code = bool(re.search(r"\b\d{2}\s+\d{2}\s+\d{2}\b", t))
+    has_kg = bool(re.search(r"\d[\d\.,]*\s*kg\b", t, flags=re.IGNORECASE))
+    return not (has_code and has_kg)
+
+
+def parse_sinader_rows_visual_segmented(pdf_path: str) -> List[Dict[str, str]]:
     rows_out: List[Dict[str, str]] = []
     known_treatments = load_treatment_level3_terms()
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            try:
-                words = page.extract_words(use_text_flow=True, keep_blank_chars=False) or []
-            except Exception:
-                words = page.extract_words() or []
-            lines = _build_visual_lines_from_words(words)
-            blocks = _reconstruct_row_blocks_from_visual_lines(lines)
-            for (y0, y1), block_text in blocks:
-                text_to_parse = block_text
-                if len(block_text) < 25:
-                    ocr_text = _ocr_row_region_if_needed(page, y0, y1)
-                    if ocr_text:
-                        text_to_parse = ocr_text
-                parsed = _parse_reconstructed_row_block(text_to_parse, known_treatments)
+    if fitz is None or cv2 is None or np is None:
+        return rows_out
+    doc = fitz.open(pdf_path)
+    try:
+        for page_index in range(doc.page_count):
+            rendered = render_pdf_page_to_image(doc, page_index, dpi=220)
+            if not rendered:
+                continue
+            img_bgr, _, _, scale_x, scale_y = rendered
+            table_bbox = detect_table_bbox_from_image(img_bgr)
+            if not table_bbox:
+                continue
+            row_boxes = segment_row_bboxes_from_image(img_bgr, table_bbox)
+            page = doc.load_page(page_index)
+            for bbox_img in row_boxes:
+                text_native = extract_pdf_text_from_bbox(page, bbox_img, scale_x, scale_y)
+                text_used = text_native
+                if _row_text_is_incoherent(text_native):
+                    text_ocr = ocr_text_from_bbox(img_bgr, bbox_img)
+                    if text_ocr and (not text_native or len(text_ocr) > len(text_native) * 0.7):
+                        text_used = text_ocr
+                parsed = _parse_reconstructed_row_block(text_used, known_treatments)
                 if parsed:
+                    parsed["Texto fila original"] = text_used
                     rows_out.append(parsed)
+    finally:
+        doc.close()
     uniq = {}
     for r in rows_out:
         key = (r.get("Código principal", ""), _norm(r.get("Descripción Residuo", "")), _clean_cell(r.get("Cantidad (Kg)", "")))
         uniq.setdefault(key, r)
     return list(uniq.values())
+
+
+def parse_sinader_rows_hybrid(pdf_path: str) -> List[Dict[str, str]]:
+    return parse_sinader_rows_visual_segmented(pdf_path)
 
 
 def extract_global_treatment_from_text(full_text: str, known_treatments: Optional[List[str]] = None) -> str:
@@ -909,13 +992,42 @@ def extract_sinader_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[
     rows_from_text = parse_sinader_rows_from_text(full_text)
     rows_from_hybrid = parse_sinader_rows_hybrid(pdf_path)
 
-    def _score_rows(rows: List[Dict[str, str]]) -> tuple[int, int, int]:
-        valid_core = sum(1 for r in rows if _clean_cell(r.get("Código principal", "")) and _clean_cell(r.get("Cantidad (Kg)", "")))
-        with_treatment = sum(1 for r in rows if _clean_cell(r.get("Tratamiento", "")))
-        return (valid_core, with_treatment, len(rows))
+    def _score_rows(rows: List[Dict[str, str]]) -> tuple[float, int]:
+        if not rows:
+            return (-9999.0, 0)
+        score = 0.0
+        for r in rows:
+            code = _clean_cell(r.get("Código principal", ""))
+            qty = _clean_cell(r.get("Cantidad (Kg)", ""))
+            desc = _clean_cell(r.get("Descripción Residuo", ""))
+            dst = _clean_cell(r.get("Destino", ""))
+            trt = _clean_cell(r.get("Tratamiento", ""))
+            if re.match(r"^\d{2}\s+\d{2}\s+\d{2}$", code):
+                score += 2.5
+            if _to_float_kg(qty) is not None:
+                score += 2.0
+            if _norm(_clean_cell(r.get("Parsing_OK", ""))) in {"si", "yes", "true"}:
+                score += 2.0
+            if _norm(_clean_cell(r.get("Tratamiento_confiable", ""))) in {"si", "yes", "true"}:
+                score += 1.2
+            if _norm(_clean_cell(r.get("Destino_confiable", ""))) in {"si", "yes", "true"}:
+                score += 1.2
+            dst_norm = _norm(dst)
+            trt_norm = _norm(trt)
+            if any(_norm(f) in dst_norm for f in DESTINATION_NOISE_FRAGMENTS):
+                score -= 2.5
+            if any(_norm(f) in trt_norm for f in TREATMENT_NOISE_FRAGMENTS):
+                score -= 2.5
+            desc_tokens = [t for t in _norm(desc).split() if len(t) >= 8]
+            if dst_norm and sum(1 for t in desc_tokens if t in dst_norm) >= 2:
+                score -= 2.0
+            if trt_norm and sum(1 for t in desc_tokens if t in trt_norm) >= 2:
+                score -= 2.0
+        return (score, len(rows))
 
-    candidates = [rows_from_tables, rows_from_text, rows_from_hybrid]
-    detail_rows = max(candidates, key=_score_rows)
+    candidates = [("tables", rows_from_tables), ("text", rows_from_text), ("visual", rows_from_hybrid)]
+    method, detail_rows = max(candidates, key=lambda x: _score_rows(x[1]))
+    logger.info("Método SINADER seleccionado: %s (filas=%s, score=%.2f)", method, len(detail_rows), _score_rows(detail_rows)[0])
 
     known_treatments = load_treatment_level3_terms()
     global_treatment = extract_global_treatment_from_text(full_text, known_treatments)
