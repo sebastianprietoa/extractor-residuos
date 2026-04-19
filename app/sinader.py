@@ -1206,8 +1206,22 @@ def defra_classification(desc_residuo: str, sin_movimientos: str = "", codigo_pr
         return "Plastics: average plastic rigid"
     if cod == "02 01 99":
         return "Organic: mixed food and garden waste"
+    if cod == "02 01 02":
+        return "Organic: food and drink waste"
+    if cod == "02 02 02":
+        return "Organic: food and drink waste"
+    if cod == "02 02 03":
+        return "Organic: food and drink waste"
     if cod == "02 02 04":
         return "Organic: food and drink waste"
+    if cod == "20 01 39":
+        return "Plastics: average plastics"
+    if cod == "15 01 06":
+        return "Commercial and industrial waste"
+    if cod == "21 07 09":
+        return "Organic: mixed food and garden waste"
+    if cod == "21 07 01":
+        return "Organic: mixed food and garden waste"
     if cod == "19 08 05":
         return "Commercial and industrial waste"
     if cod == "20 01 99":
@@ -1284,7 +1298,7 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
         "RUT Titular", "Realizado por", "Tipo", "Estado", "Código identificador", "Región", "Comuna",
         "Sin movimientos", "N.", "Descripción Residuo", "Descripción Residuo Original", "Código principal",
         "Peligrosidad", "Cantidad (Kg)", "Tratamiento", "Destino", "Transportista", "Patente",
-        "Contenedor", "Estado contenedor", "Texto fila original", "Parsing_OK", "Tratamiento_confiable", "Destino_confiable", "DEFRA_base", "DEFRA",
+        "Contenedor", "Estado contenedor", "Texto fila original", "Parsing_OK", "Tratamiento_confiable", "Destino_confiable", "DEFRA_base", "DEFRA", "DEFRA_source", "DEFRA_confiable",
     ]
     cols = [c for c in preferred_cols if c in df.columns] + [c for c in df.columns if c not in preferred_cols]
     df = df[cols] if not df.empty else pd.DataFrame(columns=preferred_cols)
@@ -1303,6 +1317,10 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
     treatment_defra_map = load_treatment_defra_map()
     if "DEFRA" not in df.columns:
         df["DEFRA"] = ""
+    if "DEFRA_source" not in df.columns:
+        df["DEFRA_source"] = ""
+    if "DEFRA_confiable" not in df.columns:
+        df["DEFRA_confiable"] = "NO"
     df["DEFRA_base"] = df.apply(
         lambda r: defra_classification(
             desc_residuo=r.get("Descripción Residuo", ""),
@@ -1314,6 +1332,7 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
         axis=1,
     )
     df["DEFRA"] = df["DEFRA_base"]
+    df["DEFRA_source"] = df["DEFRA_base"].apply(lambda x: "heredada_base" if _clean_cell(x) else "sin_clasificar")
     if "Tratamiento" in df.columns:
         def _treatment_is_reliable(row) -> bool:
             t = _norm(_clean_cell(row.get("Tratamiento", "")))
@@ -1330,14 +1349,37 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
                 return False
             return True
 
-        df["DEFRA"] = df.apply(
-            lambda r: (
-                map_treatment_to_defra(r.get("Tratamiento", ""), treatment_defra_map)
-                if _treatment_is_reliable(r)
-                else ""
-            ) or r.get("DEFRA_base", ""),
-            axis=1,
-        )
+        def _resolve_defra(row: pd.Series) -> Tuple[str, str]:
+            base_value = _clean_cell(row.get("DEFRA_base", ""))
+            treatment_value = _clean_cell(row.get("Tratamiento", ""))
+            code_value = _clean_cell(row.get("Código principal", ""))
+            desc_value = _clean_cell(row.get("Descripción Residuo", ""))
+            destination_value = _clean_cell(row.get("Destino", ""))
+            if _treatment_is_reliable(row):
+                mapped = _clean_cell(map_treatment_to_defra(treatment_value, treatment_defra_map))
+                if mapped:
+                    return mapped, "ajustada_tratamiento"
+            contextual = _clean_cell(defra_classification(
+                desc_residuo=desc_value,
+                sin_movimientos=row.get("Sin movimientos", ""),
+                codigo_principal=code_value,
+                tratamiento=treatment_value if _treatment_is_reliable(row) else "",
+                destino=destination_value,
+            ))
+            if contextual:
+                if contextual == base_value:
+                    return contextual, "heredada_base"
+                return contextual, "ajustada_regla_codigo"
+            if base_value:
+                return base_value, "heredada_base"
+            return "", "sin_clasificar"
+
+        resolved = df.apply(_resolve_defra, axis=1)
+        df["DEFRA"] = resolved.apply(lambda x: x[0])
+        df["DEFRA_source"] = resolved.apply(lambda x: x[1])
+    df["DEFRA_confiable"] = df["DEFRA_source"].apply(
+        lambda x: "SI" if _clean_cell(x) in {"heredada_base", "ajustada_tratamiento", "ajustada_regla_codigo"} else "NO"
+    )
     Path(output_excel).parent.mkdir(parents=True, exist_ok=True)
     df.to_excel(output_excel, index=False)
     logger.info("Excel generado: %s | filas=%s", output_excel, len(df))
@@ -1351,6 +1393,8 @@ def summarize_parsing_quality(df: pd.DataFrame, known_treatments: Optional[List[
             "rows_parsing_no": 0,
             "rows_destino_contaminado": 0,
             "rows_tratamiento_fuera_catalogo": 0,
+            "rows_defra_vacia": 0,
+            "rows_defra_distinta_base": 0,
         }
     known_treatments = known_treatments or load_treatment_level3_terms() or STRONG_TREATMENT_CATALOG
     known_treatment_norm = {_norm(t) for t in known_treatments if _clean_cell(t)}
@@ -1380,6 +1424,8 @@ def summarize_parsing_quality(df: pd.DataFrame, known_treatments: Optional[List[
         "rows_parsing_no": int((df.get("Parsing_OK", pd.Series(dtype=str)).fillna("NO").astype(str).str.upper() != "SI").sum()),
         "rows_destino_contaminado": int(df.apply(_dst_contaminated, axis=1).sum()),
         "rows_tratamiento_fuera_catalogo": int(df.apply(_trt_outside_catalog, axis=1).sum()),
+        "rows_defra_vacia": int((df.get("DEFRA", pd.Series(dtype=str)).fillna("").astype(str).str.strip() == "").sum()),
+        "rows_defra_distinta_base": int((df.get("DEFRA", pd.Series(dtype=str)).fillna("").astype(str).str.strip() != df.get("DEFRA_base", pd.Series(dtype=str)).fillna("").astype(str).str.strip()).sum()),
     }
 
 
