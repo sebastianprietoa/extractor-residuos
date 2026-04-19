@@ -1,12 +1,18 @@
 import re
 import unicodedata
 import logging
+import os
+import glob
+import importlib
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from difflib import SequenceMatcher
 
 import pandas as pd
 import pdfplumber
+
+_pytesseract_spec = importlib.util.find_spec("pytesseract")
+pytesseract = importlib.import_module("pytesseract") if _pytesseract_spec else None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,6 +45,76 @@ MASTER_RESIDUOS: Dict[str, List[str]] = {
     "21 04 04": ["Residuos de plásticos (HDPE, PEE, PETE, PVC) excepto planzas, boyas, flotadores, redes y cabos."],
 }
 
+DEFAULT_CATALOG_PATH = Path("assets/sinader_codigos.xlsx")
+PREFERRED_CATALOG_SHEETS = ("LER_completo_842",)
+TREATMENT_CATALOG_SHEET = "Tratamiento_SINADER"
+DEFAULT_TREATMENT_DEFRA_MAP = {
+    "reutilizacion": "Re-use",
+    "reciclaje": "Open-loop",
+    "combustion": "Combustion",
+    "vertedero": "Landfill",
+    "anaerobic digestion": "Anaerobic digestion",
+}
+DEFAULT_TREATMENT_TRAINING_GLOB = "assets/*output*.xlsx"
+KNOWN_DESTINATIONS = [
+    "ECOPRIAL",
+    "ECOFIBRAS SUCURSAL PUERTO MONTT",
+    "PLASTICOS DEL SUR SPA",
+    "CONSORCIO COLLIPULLI",
+    "ESCOMBRERA TRESOL",
+    "CENTRO CRUCERO",
+    "PLANTA DE TRATAMIENTO DE AGUAS SERVIDAS DE CASTRO",
+    "RELLENO SANITARIO LOS ANGELES",
+    "PLANTA DE TRATAMIENTO DE RESIDUOS DOMICILIARIOS LAUTARO",
+    "SALMONOIL S.A.",
+    "LOS GLACIARES",
+    "PESQUERA LANDES ISLA ROCUANT",
+    "PESQUERA LA PORTADA",
+    "REPLACAR",
+    "PLANTA RILESUR",
+    "ESTACIÓN DE TRANSFERENCIA",
+    "ESTACION DE TRANSFERENCIA",
+    "ECOFIBRAS SUCURSAL CORONEL",
+    "ECOBIO",
+    "CANCHA COMPOSTAJE LOS REBALSES DEL SUR",
+    "CANCHA LOS REBALSES DEL SUR",
+]
+DESTINATION_NOISE_FRAGMENTS = [
+    "en otra categoría",
+    "planzas, boyas, flotadores, redes y cabos",
+    "cenizas del hogar",
+    "lodos del tratamiento",
+    "del tratamiento in situ de efluentes",
+    "cartón y productos de papel",
+]
+TREATMENT_NOISE_FRAGMENTS = [
+    "en otra categoría",
+    "especificadas en otra categoría",
+    "planzas, boyas, flotadores, redes y cabos",
+    "cenizas del hogar",
+    "lodos del tratamiento in situ de efluentes",
+]
+STRONG_TREATMENT_CATALOG = [
+    "Reciclaje de plásticos",
+    "Reciclaje de metales",
+    "Reciclaje de papel, cartón y productos de papel",
+    "Relleno sanitario",
+    "Monorelleno",
+    "Degradación Anaeróbica",
+    "Compostaje",
+    "Recepción de Lodos en PTAS",
+    "Sitio de Escombros de la Construcción",
+    "Pretratamiento",
+    "Pretratamiento de plásticos",
+    "Reciclaje de residuos hidrobiológicos para consumo animal",
+    "Residuos municipales asimilables a domiciliarios",
+    "Disposición final",
+]
+KNOWN_SINADER_CODES = {
+    "15 01 01", "15 01 02", "15 01 04", "20 01 99", "19 08 05", "10 01 01", "21 04 04", "02 02 04",
+    "02 01 99", "02 01 02", "02 02 02", "02 02 03", "20 01 39", "15 01 06", "21 07 09", "21 07 01",
+}
+
 
 def _strip_accents(s: str) -> str:
     if s is None:
@@ -59,6 +135,18 @@ def _clean_cell(s: Optional[str]) -> str:
     s = str(s).replace("\u00a0", " ")
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+
+def _normalize_code(code: Optional[str]) -> str:
+    raw = _clean_cell(code)
+    if not raw:
+        return ""
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 6:
+        return f"{digits[0:2]} {digits[2:4]} {digits[4:6]}"
+    if len(digits) > 6:
+        return f"{digits[0:2]} {digits[2:4]} {digits[4:6]}"
+    return raw
 
 
 def _cell_join_multiline(x: Optional[str]) -> str:
@@ -215,48 +303,218 @@ def _split_code_and_desc(residuo_cell: str) -> Tuple[str, str]:
     return "", s
 
 
+def _extract_table_text_block(full_text: str) -> str:
+    text = full_text.replace("\r", "\n").replace("\u00a0", " ")
+    start_match = re.search(r"Residuo.*Cantidad.*Destino", text, flags=re.IGNORECASE | re.DOTALL)
+    if not start_match:
+        return text
+    block = text[start_match.start():]
+    end_match = re.search(r"La\s+integridad\s+y\s+veracidad", block, flags=re.IGNORECASE)
+    if end_match:
+        block = block[:end_match.start()]
+    return block
+
+
+def _reconstruct_row_blocks_from_lines(lines: List[str]) -> List[str]:
+    blocks: List[str] = []
+    current: List[str] = []
+    ler_start = re.compile(r"^\s*\d{2}\s+\d{2}\s+\d{2}\s*\|")
+    header_noise = re.compile(r"^\s*(residuo|cantidad|tipo\s*tratamiento|tratamiento|destino|transportista|patente)\b", flags=re.IGNORECASE)
+    for ln in lines:
+        line = _clean_cell(ln)
+        if not line:
+            continue
+        if header_noise.search(line) and "|" not in line and not ler_start.match(line):
+            continue
+        if "cantidad residuo tipo tratamiento destino" in _norm(line):
+            continue
+        if ler_start.match(line):
+            if current:
+                blocks.append(_clean_cell(" ".join(current)))
+            current = [line]
+        else:
+            if current:
+                current.append(line)
+    if current:
+        blocks.append(_clean_cell(" ".join(current)))
+    return blocks
+
+
+def _parse_reconstructed_row_block(
+    block: str,
+    known_treatments: Optional[List[str]] = None,
+) -> Optional[Dict[str, str]]:
+    def _find_catalog_match_spans(text: str, catalog: List[str]) -> List[Tuple[int, int, str]]:
+        spans: List[Tuple[int, int, str]] = []
+        for term in sorted(set(catalog), key=lambda x: len(x), reverse=True):
+            if not _clean_cell(term):
+                continue
+            m = re.search(re.escape(term), text, flags=re.IGNORECASE)
+            if m:
+                spans.append((m.start(), m.end(), term))
+        return spans
+
+    def _is_destination_clean(dst_text: str, desc_text: str) -> bool:
+        d = _norm(dst_text)
+        if not d:
+            return False
+        if any(_norm(x) in d for x in DESTINATION_NOISE_FRAGMENTS):
+            return False
+        dn = _norm(desc_text)
+        if dn:
+            generic_tokens = {
+                "residuos", "residuo", "plastico", "plasticos", "plástico", "plásticos", "envases", "organicos",
+                "orgánicos", "tratamiento", "lodos", "subproductos", "fracciones", "especificadas",
+            }
+            for token in [t for t in dn.split() if len(t) >= 6]:
+                if token in generic_tokens:
+                    continue
+                if token in d and token not in {"puerto", "tratamiento"}:
+                    return False
+        return True
+
+    def _is_treatment_clean(treatment_text: str, desc_text: str) -> bool:
+        t = _norm(treatment_text)
+        if not t:
+            return False
+        if any(_norm(x) in t for x in TREATMENT_NOISE_FRAGMENTS):
+            return False
+        dn = _norm(desc_text)
+        if dn:
+            long_tokens = [tok for tok in dn.split() if len(tok) >= 8]
+            if long_tokens and sum(1 for tok in long_tokens if tok in t) >= 2:
+                return False
+        return True
+
+    def _parse_tail_right_to_left(tail: str, desc_text: str) -> Tuple[str, str, str, str, bool, bool]:
+        text = _clean_cell(tail)
+        if not text:
+            return "", "", "", "", False, False
+        pat = ""
+        trp = ""
+        m_marker = re.search(r"\b\d+\|\s*$", text)
+        if m_marker:
+            text = _clean_cell(text[:m_marker.start()])
+        m_plate = re.search(r"\b((?=[A-Z0-9-]*\d)(?:[A-Z]{2,4}-[A-Z0-9]{2,4}|[A-Z]{2,4}[0-9]{2,4}))\b\s*$", text)
+        if m_plate:
+            candidate_plate = _clean_cell(m_plate.group(1)).replace(" ", "-")
+            if not re.fullmatch(r"\d+\|?", candidate_plate):
+                pat = candidate_plate
+                text = _clean_cell(text[:m_plate.start()])
+
+        treatment_catalog = list(dict.fromkeys(STRONG_TREATMENT_CATALOG + (known_treatments or [])))
+        chosen_treatment = ""
+        chosen_destination = ""
+        destination_spans = _find_catalog_match_spans(text, KNOWN_DESTINATIONS)
+        treatment_spans = _find_catalog_match_spans(text, treatment_catalog) if treatment_catalog else []
+        best_pair: Optional[Tuple[Tuple[int, int, str], Tuple[int, int, str]]] = None
+        best_pair_score = -1
+        for t_span in treatment_spans:
+            for d_span in destination_spans:
+                overlap = not (t_span[1] <= d_span[0] or d_span[1] <= t_span[0])
+                if overlap:
+                    continue
+                score = (t_span[1] - t_span[0]) + (d_span[1] - d_span[0])
+                if t_span[0] <= d_span[0]:
+                    score += 5
+                if score > best_pair_score:
+                    best_pair_score = score
+                    best_pair = (t_span, d_span)
+
+        if best_pair:
+            t_span, d_span = best_pair
+            chosen_treatment = t_span[2]
+            chosen_destination = d_span[2]
+            for span in sorted([t_span, d_span], key=lambda x: x[0], reverse=True):
+                text = _clean_cell(text[:span[0]] + " " + text[span[1]:])
+        else:
+            if destination_spans:
+                d_span = destination_spans[0]
+                chosen_destination = d_span[2]
+                text = _clean_cell(text[:d_span[0]] + " " + text[d_span[1]:])
+            if treatment_spans:
+                t_span = treatment_spans[0]
+                chosen_treatment = t_span[2]
+                text = _clean_cell(text[:t_span[0]] + " " + text[t_span[1]:])
+
+        text = re.sub(r"\b(destino|transportista|patente|cantidad|residuo|tipo tratamiento)\b", " ", text, flags=re.IGNORECASE)
+        text = _clean_cell(re.sub(r"\s+", " ", text))
+        dst = chosen_destination or text
+        trt_ok = bool(chosen_treatment) and _norm(chosen_treatment) in {_norm(x) for x in treatment_catalog} and _is_treatment_clean(chosen_treatment, desc_text)
+        dst_ok = bool(chosen_destination) and _is_destination_clean(dst, desc_text)
+        return chosen_treatment, dst, trp, pat, trt_ok, dst_ok
+
+    block = _clean_cell(block)
+    if not block:
+        return None
+    m_code = re.match(r"^\s*(\d{2}\s+\d{2}\s+\d{2})\s*\|\s*(.*)$", block)
+    if not m_code:
+        return None
+    code = _clean_cell(m_code.group(1))
+    rest = _clean_cell(m_code.group(2))
+    m_qty = re.search(r"(?P<qty>\d[\d\.,]*)\s*kg\b", rest, flags=re.IGNORECASE)
+    if not m_qty:
+        return {
+            "Código principal": code,
+            "Descripción Residuo": rest,
+            "Cantidad (Kg)": "",
+            "Tratamiento": "",
+            "Destino": "",
+            "Transportista": "",
+            "Patente": "",
+            "Peligrosidad": "",
+            "Estado contenedor": "",
+            "Contenedor": "",
+            "Texto fila original": block,
+            "Parsing_OK": "NO",
+            "Tratamiento_confiable": "NO",
+            "Destino_confiable": "NO",
+        }
+    desc = _clean_cell(rest[:m_qty.start()])
+    qty = _clean_cell(m_qty.group("qty"))
+    tail = _clean_cell(rest[m_qty.end():])
+    trt_raw, dst_raw, trp_raw, pat_raw, trt_ok, dst_ok = _parse_tail_right_to_left(tail, desc)
+    trt, dst, trp, pat = _sanitize_treatment_and_logistics(
+        trt_raw or tail,
+        dst_raw,
+        trp_raw,
+        pat_raw,
+        qty,
+        known_treatments,
+        desc,
+    )
+    treatment_catalog_norm = {_norm(x) for x in (STRONG_TREATMENT_CATALOG + (known_treatments or []))}
+    known_destination_norm = {_norm(x) for x in KNOWN_DESTINATIONS}
+    trt_ok = bool(trt) and _norm(trt) in treatment_catalog_norm and _is_treatment_clean(trt, desc)
+    dst_ok = bool(dst) and (
+        _norm(dst) in known_destination_norm
+        or any(k in _norm(dst) for k in known_destination_norm if k)
+    ) and _is_destination_clean(dst, desc)
+    qty_ok = _to_float_kg(qty) is not None
+    code_ok = bool(code and re.match(r"^\d{2}\s+\d{2}\s+\d{2}$", code))
+    semantic_ok = (trt_ok or dst_ok) and _is_destination_clean(dst, desc) and (not trt or _is_treatment_clean(trt, desc))
+    parsing_ok = bool(code_ok and desc and qty_ok and semantic_ok)
+    return {
+        "Código principal": code,
+        "Descripción Residuo": desc,
+        "Cantidad (Kg)": qty,
+        "Tratamiento": trt,
+        "Destino": dst,
+        "Transportista": trp,
+        "Patente": pat,
+        "Peligrosidad": "",
+        "Estado contenedor": "",
+        "Contenedor": "",
+        "Texto fila original": block,
+        "Parsing_OK": "SI" if parsing_ok else "NO",
+        "Tratamiento_confiable": "SI" if trt_ok and bool(trt) else "NO",
+        "Destino_confiable": "SI" if dst_ok and bool(dst) else "NO",
+    }
+
+
 def parse_sinader_rows_from_tables(pdf_path: str) -> List[Dict[str, str]]:
     rows_out: List[Dict[str, str]] = []
-
-    def _merge_continuations(tb_rows, idx_res, idx_qty, idx_trt, idx_dst, idx_trp, idx_pat):
-        merged = []
-        for r in tb_rows:
-            r = list(r) if r else []
-            max_idx = max([i for i in [idx_res, idx_qty, idx_trt, idx_dst, idx_trp, idx_pat] if i is not None] + [0])
-            if len(r) <= max_idx:
-                r += [""] * (max_idx + 1 - len(r))
-            if not merged:
-                merged.append(r)
-                continue
-            res_val = _clean_cell(r[idx_res]) if idx_res is not None else ""
-            qty_val = _clean_cell(r[idx_qty]) if idx_qty is not None else ""
-            trt_val = _clean_cell(r[idx_trt]) if idx_trt is not None else ""
-            dst_val = _clean_cell(r[idx_dst]) if idx_dst is not None else ""
-            trp_val = _clean_cell(r[idx_trp]) if idx_trp is not None else ""
-            pat_val = _clean_cell(r[idx_pat]) if idx_pat is not None else ""
-            looks_like_continuation = (qty_val == "") and any([res_val, trt_val, dst_val, trp_val, pat_val])
-            if looks_like_continuation:
-                prev = merged[-1]
-                if len(prev) <= max_idx:
-                    prev += [""] * (max_idx + 1 - len(prev))
-                    merged[-1] = prev
-                def append_col(i: int, new_text: str):
-                    if new_text:
-                        old = _clean_cell(prev[i])
-                        prev[i] = (old + " " + new_text).strip() if old else new_text
-                append_col(idx_res, res_val)
-                if idx_trt is not None:
-                    append_col(idx_trt, trt_val)
-                if idx_dst is not None:
-                    append_col(idx_dst, dst_val)
-                if idx_trp is not None:
-                    append_col(idx_trp, trp_val)
-                if idx_pat is not None:
-                    append_col(idx_pat, pat_val)
-                continue
-            merged.append(r)
-        return merged
-
+    known_treatments = load_treatment_level3_terms()
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
             try:
@@ -266,48 +524,20 @@ def parse_sinader_rows_from_tables(pdf_path: str) -> List[Dict[str, str]]:
             for tb in tables:
                 if not tb or not tb[0]:
                     continue
-                header = [_norm(_clean_cell(c)) for c in tb[0]]
-                header_join = " ".join(header)
-                if not (("residuo" in header_join) and ("cantidad" in header_join) and ("destino" in header_join)):
+                if not _looks_like_sinader_table(tb):
                     continue
-
-                def find_col(*needles: str) -> Optional[int]:
-                    for i, h in enumerate(header):
-                        if any(n in h for n in needles):
-                            return i
-                    return None
-
-                c_res = find_col("residuo")
-                c_qty = find_col("cantidad")
-                c_trt = find_col("tratamiento", "tipo tratamiento", "tipo")
-                c_dst = find_col("destino")
-                c_trp = find_col("transportista")
-                c_pat = find_col("patente")
-                if c_res is None or c_qty is None:
-                    continue
-                body_merged = _merge_continuations(tb[1:], c_res, c_qty, c_trt, c_dst, c_trp, c_pat)
-                for r in body_merged:
-                    def g(i):
-                        if i is None or i >= len(r):
-                            return ""
-                        return _cell_join_multiline(r[i])
-                    residuo_cell = g(c_res)
-                    qty_cell = g(c_qty)
-                    if _clean_cell(residuo_cell) == "" and _clean_cell(qty_cell) == "":
+                raw_lines: List[str] = []
+                for r in tb[1:]:
+                    cells = [_clean_cell(c) for c in (r or []) if _clean_cell(c)]
+                    if not cells:
                         continue
-                    cod, desc = _split_code_and_desc(residuo_cell)
-                    rows_out.append({
-                        "Código principal": cod,
-                        "Descripción Residuo": desc,
-                        "Cantidad (Kg)": qty_cell,
-                        "Tratamiento": g(c_trt),
-                        "Destino": g(c_dst),
-                        "Transportista": g(c_trp),
-                        "Patente": g(c_pat),
-                        "Peligrosidad": "",
-                        "Estado contenedor": "",
-                        "Contenedor": "",
-                    })
+                    raw_lines.append(" | ".join(cells))
+                blocks = _reconstruct_row_blocks_from_lines(raw_lines)
+                for block in blocks:
+                    parsed = _parse_reconstructed_row_block(block, known_treatments)
+                    if not parsed:
+                        continue
+                    rows_out.append(parsed)
     uniq = {}
     for r in rows_out:
         key = (r.get("Código principal", ""), _norm(r.get("Descripción Residuo", "")), _clean_cell(r.get("Cantidad (Kg)", "")))
@@ -316,38 +546,340 @@ def parse_sinader_rows_from_tables(pdf_path: str) -> List[Dict[str, str]]:
 
 
 def parse_sinader_rows_from_text(full_text: str) -> List[Dict[str, str]]:
-    rows_out = []
+    rows_out: List[Dict[str, str]] = []
     if not full_text:
         return rows_out
-    text_flat = full_text.replace("\r", "\n").replace("\u00a0", " ")
-    text_flat = re.sub(r"\n+", "\n", text_flat)
-    pattern = re.compile(
-        r"(?P<codigo>\d{2}\s\d{2}\s\d{2})\s*\|\s*(?P<desc>.*?)\s+(?P<cantidad>\d[\d\.,]*)\s*kg\b",
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    for m in pattern.finditer(text_flat):
-        desc = _cell_join_multiline(m.group("desc"))
-        desc = re.sub(r"^(Residuo\s+)?", "", desc, flags=re.IGNORECASE).strip()
-        desc = re.sub(r"\b(Tipo Tratamiento|Destino|Transportista|Patente)\b.*$", "", desc, flags=re.IGNORECASE).strip()
-        if not desc:
-            continue
-        rows_out.append({
-            "Código principal": _clean_cell(m.group("codigo")),
-            "Descripción Residuo": desc,
-            "Cantidad (Kg)": _clean_cell(m.group("cantidad")),
-            "Tratamiento": "",
-            "Destino": "",
-            "Transportista": "",
-            "Patente": "",
-            "Peligrosidad": "",
-            "Estado contenedor": "",
-            "Contenedor": "",
-        })
+    known_treatments = load_treatment_level3_terms()
+    block_text = _extract_table_text_block(full_text)
+    lines = [_clean_cell(x) for x in block_text.splitlines() if _clean_cell(x)]
+    blocks = _reconstruct_row_blocks_from_lines(lines)
+    for block in blocks:
+        parsed = _parse_reconstructed_row_block(block, known_treatments)
+        if parsed:
+            rows_out.append(parsed)
     uniq = {}
     for r in rows_out:
         key = (r.get("Código principal", ""), _norm(r.get("Descripción Residuo", "")), _clean_cell(r.get("Cantidad (Kg)", "")))
         uniq.setdefault(key, r)
     return list(uniq.values())
+
+
+def _build_visual_lines_from_words(words: List[Dict], y_tolerance: float = 3.0) -> List[Tuple[float, str]]:
+    if not words:
+        return []
+    sorted_words = sorted(words, key=lambda w: (float(w.get("top", 0)), float(w.get("x0", 0))))
+    lines: List[Tuple[float, List[Dict]]] = []
+    for w in sorted_words:
+        w_top = float(w.get("top", 0))
+        if not lines:
+            lines.append((w_top, [w]))
+            continue
+        last_top, last_words = lines[-1]
+        if abs(w_top - last_top) <= y_tolerance:
+            last_words.append(w)
+            new_top = (last_top * (len(last_words) - 1) + w_top) / len(last_words)
+            lines[-1] = (new_top, last_words)
+        else:
+            lines.append((w_top, [w]))
+    out: List[Tuple[float, str]] = []
+    for y, line_words in lines:
+        ordered = sorted(line_words, key=lambda ww: float(ww.get("x0", 0)))
+        text = _clean_cell(" ".join(_clean_cell(ww.get("text", "")) for ww in ordered))
+        if text:
+            out.append((y, text))
+    return out
+
+
+def _reconstruct_row_blocks_from_visual_lines(lines: List[Tuple[float, str]]) -> List[Tuple[Tuple[float, float], str]]:
+    blocks: List[Tuple[Tuple[float, float], str]] = []
+    current_text: List[str] = []
+    y_start = None
+    y_end = None
+    ler_start = re.compile(r"^\s*\d{2}\s+\d{2}\s+\d{2}\b")
+    header_seen = False
+    for y, text in lines:
+        norm_line = _norm(text)
+        if not header_seen and ("residuo" in norm_line and "cantidad" in norm_line and "destino" in norm_line):
+            header_seen = True
+            continue
+        if not header_seen:
+            continue
+        if ler_start.match(text):
+            if current_text:
+                blocks.append(((float(y_start or 0), float(y_end or 0)), _clean_cell(" ".join(current_text))))
+            current_text = [text]
+            y_start = y
+            y_end = y
+        elif current_text:
+            current_text.append(text)
+            y_end = y
+    if current_text:
+        blocks.append(((float(y_start or 0), float(y_end or 0)), _clean_cell(" ".join(current_text))))
+    return blocks
+
+
+def _ocr_row_region_if_needed(page, y0: float, y1: float) -> str:
+    if pytesseract is None:
+        return ""
+    try:
+        crop = page.within_bbox((0, max(0, y0 - 2), page.width, min(page.height, y1 + 2)))
+        im = crop.to_image(resolution=220).original
+        text = pytesseract.image_to_string(im, lang="spa+eng")
+        return _clean_cell(text)
+    except Exception:
+        return ""
+
+
+def parse_sinader_rows_hybrid(pdf_path: str) -> List[Dict[str, str]]:
+    rows_out: List[Dict[str, str]] = []
+    known_treatments = load_treatment_level3_terms()
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            try:
+                words = page.extract_words(use_text_flow=True, keep_blank_chars=False) or []
+            except Exception:
+                words = page.extract_words() or []
+            lines = _build_visual_lines_from_words(words)
+            blocks = _reconstruct_row_blocks_from_visual_lines(lines)
+            for (y0, y1), block_text in blocks:
+                text_to_parse = block_text
+                if len(block_text) < 25:
+                    ocr_text = _ocr_row_region_if_needed(page, y0, y1)
+                    if ocr_text:
+                        text_to_parse = ocr_text
+                parsed = _parse_reconstructed_row_block(text_to_parse, known_treatments)
+                if parsed:
+                    rows_out.append(parsed)
+    uniq = {}
+    for r in rows_out:
+        key = (r.get("Código principal", ""), _norm(r.get("Descripción Residuo", "")), _clean_cell(r.get("Cantidad (Kg)", "")))
+        uniq.setdefault(key, r)
+    return list(uniq.values())
+
+
+def extract_global_treatment_from_text(full_text: str, known_treatments: Optional[List[str]] = None) -> str:
+    text = _cell_join_multiline(full_text or "")
+    if not text:
+        return ""
+    text_norm = _norm(text)
+    if known_treatments:
+        for term in sorted(known_treatments, key=lambda x: len(x), reverse=True):
+            term_norm = _norm(term)
+            if term_norm and term_norm in text_norm:
+                return term
+    patterns = [
+        r"(?:tipo\s*tratamiento|tratamiento)\s*[:\-]?\s*(reutilizaci[oó]n|reciclaje|combusti[oó]n|vertedero|anaerobic digestion)",
+        r"(?:tipo\s*tratamiento|tratamiento)\s*[:\-]?\s*([A-Za-zÁÉÍÓÚÜÑáéíóúüñ\s]{4,60})",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if m:
+            return _clean_cell(m.group(1))
+    return ""
+
+
+def _sanitize_treatment_and_logistics(
+    tratamiento: str,
+    destino: str,
+    transportista: str,
+    patente: str,
+    cantidad: str = "",
+    known_treatments: Optional[List[str]] = None,
+    descripcion: str = "",
+) -> Tuple[str, str, str, str]:
+    def _extract_treatment_phrase(text: str) -> str:
+        if not text:
+            return ""
+        text_norm = _norm(text)
+        if known_treatments:
+            for term in sorted(known_treatments, key=lambda x: len(x), reverse=True):
+                term_norm = _norm(term)
+                if not term_norm:
+                    continue
+                if term_norm in text_norm:
+                    return term
+                term_tokens = [t for t in term_norm.split() if len(t) > 3]
+                if term_tokens and all(t in text_norm for t in term_tokens):
+                    return term
+        if "degradacion" in text_norm and "anaerobica" in text_norm:
+            return "Degradación Anaeróbica"
+        if "anaerobica" in text_norm:
+            return "Degradación Anaeróbica"
+        candidates = [
+            r"relleno\s+sanitario",
+            r"sitio\s+de\s+escombros\s+de\s+la\s+construcci[oó]n",
+            r"recepci[oó]n\s+de\s+lodos\s+en\s+ptas",
+            r"reciclaje\s+de\s+residuos\s+hidrobiol[oó]gicos\s+para\s+consumo\s+animal",
+            r"residuos\s+municipales\s+asimilables\s+a\s+domiciliarios",
+            r"reciclaje\s+de\s+pl[aá]sticos",
+            r"reciclaje\s+de\s+metales",
+            r"reciclaje\s+de\s+papel(?:,\s*cart[oó]n\s*y\s*productos\s*de\s*papel)?",
+            r"monorelleno",
+            r"disposici[oó]n\s+final",
+            r"pretratamiento\s+de\s+pl[aá]sticos",
+            r"pretratamiento",
+            r"compostaje",
+            r"reutilizaci[oó]n",
+            r"combusti[oó]n",
+            r"anaerobic\s+digestion",
+            r"reciclaje",
+        ]
+        for pat in candidates:
+            m = re.search(pat, text, flags=re.IGNORECASE)
+            if m:
+                return _clean_cell(m.group(0))
+        return ""
+
+    trt = _clean_cell(tratamiento)
+    dst = _clean_cell(destino)
+    trp = _clean_cell(transportista)
+    pat = _clean_cell(patente)
+    raw_combined = f"{trt} {dst}".strip()
+
+    if trt or dst:
+        def _is_placeholder_destination(value: str) -> bool:
+            v = _norm(value)
+            return (not v) or v.startswith("in situ") or v.startswith("situ de efluentes")
+
+        def _clean_destination_noise(value: str) -> str:
+            cleaned = _clean_cell(value)
+            original_norm = _norm(cleaned)
+            for known_dst in sorted(KNOWN_DESTINATIONS, key=lambda x: len(x), reverse=True):
+                kd_norm = _norm(known_dst)
+                if kd_norm and kd_norm in original_norm:
+                    return known_dst
+            if "estacion de transferencia" in original_norm or "estación de transferencia" in original_norm:
+                return "ESTACIÓN DE TRANSFERENCIA"
+            if "collipulli" in original_norm:
+                return "CONSORCIO COLLIPULLI"
+            if "lautaro" in original_norm:
+                return "PLANTA DE TRATAMIENTO DE RESIDUOS DOMICILIARIOS LAUTARO"
+            if "ecobio" in original_norm:
+                return "ECOBIO"
+            for frag in DESTINATION_NOISE_FRAGMENTS:
+                cleaned = re.sub(re.escape(frag), " ", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r"\bespecificad[ao]s?\b", " ", cleaned, flags=re.IGNORECASE)
+            if descripcion:
+                desc_norm = _norm(descripcion)
+                for token in [t for t in desc_norm.split() if len(t) >= 7]:
+                    if token in {"tratamiento", "residuos", "categoria", "especificadas"}:
+                        continue
+                    cleaned = re.sub(rf"\b{re.escape(token)}\b", " ", cleaned, flags=re.IGNORECASE)
+            cleaned = _clean_cell(re.sub(r"\s+", " ", cleaned))
+            cleaned_norm = _norm(cleaned)
+            for known_dst in sorted(KNOWN_DESTINATIONS, key=lambda x: len(x), reverse=True):
+                kd_norm = _norm(known_dst)
+                if kd_norm and kd_norm in cleaned_norm:
+                    return known_dst
+            generic_dst_tokens = {
+                "planta", "tratamiento", "residuos", "domiciliarios", "relleno", "sanitario", "sucursal",
+                "centro", "cancha", "compostaje", "puerto", "sur", "isla", "los", "las", "del", "de",
+            }
+            cleaned_tokens = set(t for t in cleaned_norm.split() if len(t) >= 4 and t not in generic_dst_tokens)
+            best_dst = ""
+            best_score = 0
+            for known_dst in KNOWN_DESTINATIONS:
+                kd_norm = _norm(known_dst)
+                kd_tokens = set(t for t in kd_norm.split() if len(t) >= 4 and t not in generic_dst_tokens)
+                if not kd_tokens:
+                    continue
+                overlap = len(cleaned_tokens.intersection(kd_tokens))
+                if overlap > best_score:
+                    best_score = overlap
+                    best_dst = known_dst
+            if best_score >= 2 and len(cleaned_tokens) <= 4:
+                return best_dst
+            return cleaned
+
+        def _tail_after_qty_kg(text: str, qty_value: str) -> str:
+            if not text:
+                return ""
+            qty_digits = re.sub(r"\D", "", _clean_cell(qty_value))
+            matches = list(re.finditer(r"(\d[\d\.,]*)\s*kg\b", text, flags=re.IGNORECASE))
+            if not matches:
+                return ""
+            if not qty_digits:
+                return _clean_cell(text[matches[0].end():])
+            for m in matches:
+                m_digits = re.sub(r"\D", "", m.group(1))
+                if m_digits == qty_digits:
+                    return _clean_cell(text[m.end():])
+            return ""
+
+        tail_by_qty = _tail_after_qty_kg(raw_combined, cantidad)
+        if tail_by_qty:
+            phrase_from_tail = _extract_treatment_phrase(tail_by_qty)
+            if phrase_from_tail:
+                trt = phrase_from_tail
+                remainder_tail = _clean_cell(re.sub(re.escape(phrase_from_tail), "", tail_by_qty, count=1, flags=re.IGNORECASE))
+                if remainder_tail and _is_placeholder_destination(dst):
+                    dst = remainder_tail
+
+        kg_split = re.search(r"^(?P<prefix>.*?)(?P<qty>\d[\d\.,]*)\s*kg\s*(?P<after>.*)$", trt, flags=re.IGNORECASE)
+        if kg_split:
+            trt = _clean_cell(kg_split.group("prefix"))
+            trailing = _clean_cell(kg_split.group("after"))
+            if trailing and _is_placeholder_destination(dst):
+                dst = trailing
+        trt = re.sub(r"^\d[\d\.,]*\s*(kg|kgs?)\s*", "", trt, flags=re.IGNORECASE).strip()
+        if _norm(trt) in {"destino transportista patente", "destino transportista", "transportista patente"}:
+            trt = ""
+        if "|" in trt and not dst:
+            left, right = [x.strip() for x in trt.split("|", 1)]
+            if right:
+                trt = left
+                dst = right
+
+        labeled = re.search(
+            r"(?:^|\s)destino\s*[:\-]?\s*(?P<dst>.*?)(?:\s+transportista\s*[:\-]?\s*(?P<trp>.*?))?(?:\s+patente\s*[:\-]?\s*(?P<pat>.*))?$",
+            trt,
+            flags=re.IGNORECASE,
+        )
+        if labeled:
+            if not dst:
+                dst = _clean_cell(labeled.group("dst") or "")
+            if not trp:
+                trp = _clean_cell(labeled.group("trp") or "")
+            if not pat:
+                pat = _clean_cell(labeled.group("pat") or "")
+            trt = ""
+
+        phrase = _extract_treatment_phrase(trt)
+        if not phrase and raw_combined:
+            phrase = _extract_treatment_phrase(raw_combined)
+        if phrase:
+            remainder = _clean_cell(re.sub(re.escape(phrase), "", trt, count=1, flags=re.IGNORECASE))
+            if remainder and _is_placeholder_destination(dst):
+                dst = remainder
+            if dst:
+                dst = _clean_cell(re.sub(re.escape(phrase), "", dst, count=1, flags=re.IGNORECASE))
+            trt = phrase
+
+        combined_all = _clean_cell(" ".join(x for x in [trt, dst, trp, pat] if _clean_cell(x)))
+        phrase_all = _extract_treatment_phrase(combined_all) if combined_all else ""
+        if phrase_all:
+            trt = phrase_all
+            cleaned = combined_all
+            cleaned = re.sub(re.escape(phrase_all), " ", cleaned, count=1, flags=re.IGNORECASE)
+            cleaned = re.sub(r"\d[\d\.,]*\s*kg\b", " ", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r"\b(destino|transportista|patente)\b", " ", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r"\bin\s*situ\s*de\s*efluentes\b", " ", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r"\d+\|", " ", cleaned)
+            cleaned = re.sub(r"\b\d+\b", " ", cleaned)
+            if not pat:
+                m_pat = re.search(r"\b((?=[A-Z0-9-]*\d)(?:[A-Z]{2,4}-[A-Z0-9]{2,4}|[A-Z]{2,4}[0-9]{2,4}))\b", cleaned)
+                if m_pat:
+                    pat = m_pat.group(1)
+                    cleaned = cleaned.replace(m_pat.group(1), " ")
+            candidate_dst = _clean_cell(re.sub(r"\s+", " ", cleaned).strip(" |-_/"))
+            if candidate_dst and _is_placeholder_destination(dst):
+                dst = candidate_dst
+
+        if dst:
+            dst = re.sub(r"\d+\|", " ", dst)
+            dst = _clean_destination_noise(_clean_cell(re.sub(r"\s+", " ", dst)))
+
+    return trt, dst, trp, pat
 
 
 def extract_sinader_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[str, str]]:
@@ -368,10 +900,39 @@ def extract_sinader_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[
             "Transportista": "",
             "Patente": "",
             "Sin movimientos": "SI",
+            "Texto fila original": "",
+            "Parsing_OK": "SI",
+            "Tratamiento_confiable": "NO",
+            "Destino_confiable": "NO",
         }], meta
-    detail_rows = parse_sinader_rows_from_tables(pdf_path) or parse_sinader_rows_from_text(full_text)
+    rows_from_tables = parse_sinader_rows_from_tables(pdf_path)
+    rows_from_text = parse_sinader_rows_from_text(full_text)
+    rows_from_hybrid = parse_sinader_rows_hybrid(pdf_path)
+
+    def _score_rows(rows: List[Dict[str, str]]) -> tuple[int, int, int]:
+        valid_core = sum(1 for r in rows if _clean_cell(r.get("Código principal", "")) and _clean_cell(r.get("Cantidad (Kg)", "")))
+        with_treatment = sum(1 for r in rows if _clean_cell(r.get("Tratamiento", "")))
+        return (valid_core, with_treatment, len(rows))
+
+    candidates = [rows_from_tables, rows_from_text, rows_from_hybrid]
+    detail_rows = max(candidates, key=_score_rows)
+
+    known_treatments = load_treatment_level3_terms()
+    global_treatment = extract_global_treatment_from_text(full_text, known_treatments)
     out_rows = []
     for i, r in enumerate(detail_rows, start=1):
+        row_treatment = _clean_cell(r.get("Tratamiento", ""))
+        if not row_treatment and global_treatment:
+            row_treatment = global_treatment
+        row_treatment, row_destino, row_transportista, row_patente = _sanitize_treatment_and_logistics(
+            row_treatment,
+            r.get("Destino", ""),
+            r.get("Transportista", ""),
+            r.get("Patente", ""),
+            r.get("Cantidad (Kg)", ""),
+            known_treatments,
+            r.get("Descripción Residuo", ""),
+        )
         out_rows.append({
             "N.": str(i),
             "Descripción Residuo": r.get("Descripción Residuo", ""),
@@ -380,11 +941,15 @@ def extract_sinader_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[
             "Cantidad (Kg)": r.get("Cantidad (Kg)", ""),
             "Estado contenedor": r.get("Estado contenedor", ""),
             "Contenedor": r.get("Contenedor", ""),
-            "Tratamiento": r.get("Tratamiento", ""),
-            "Destino": r.get("Destino", ""),
-            "Transportista": r.get("Transportista", ""),
-            "Patente": r.get("Patente", ""),
+            "Tratamiento": row_treatment,
+            "Destino": row_destino,
+            "Transportista": row_transportista,
+            "Patente": row_patente,
             "Sin movimientos": "NO",
+            "Texto fila original": r.get("Texto fila original", ""),
+            "Parsing_OK": r.get("Parsing_OK", "NO"),
+            "Tratamiento_confiable": r.get("Tratamiento_confiable", "NO"),
+            "Destino_confiable": r.get("Destino_confiable", "NO"),
         })
     return out_rows, meta
 
@@ -421,20 +986,280 @@ def choose_canonical_description(extracted_desc: str, codigo: str, catalog: Dict
         scored = sorted([(cand, _prefix_similarity(extracted_desc, cand)) for cand in same_code_candidates], key=lambda x: x[1], reverse=True)
         if scored[0][1] >= threshold:
             return scored[0][0]
-    all_candidates = [d for descs in catalog.values() for d in descs]
-    if not all_candidates:
-        return extracted_desc
-    scored = sorted([(cand, _prefix_similarity(extracted_desc, cand)) for cand in all_candidates], key=lambda x: x[1], reverse=True)
-    return scored[0][0] if scored[0][1] >= threshold else extracted_desc
+    # Blindaje: si no hay candidatos para el mismo código, no forzar reemplazo por similitud global.
+    # Esto evita contaminaciones como 15 01 06 -> "Envases metálicos" por fuzzy matching agresivo.
+    return extracted_desc
 
 
-def apply_residuo_dictionary_correction(df: pd.DataFrame) -> pd.DataFrame:
+def _build_catalog_from_dataframe(df: pd.DataFrame) -> Dict[str, List[str]]:
+    if df.empty:
+        return {}
+    normalized_cols = {_norm(c): c for c in df.columns}
+    code_col = None
+    desc_col = None
+    code_candidates = [
+        "codigo principal",
+        "código principal",
+        "codigo",
+        "código",
+        "codigo residuo",
+        "código residuo",
+        "codigo sinader",
+        "código sinader",
+        "codigo ler",
+        "código ler",
+    ]
+    desc_candidates = [
+        "descripcion residuo",
+        "descripción residuo",
+        "descripcion",
+        "descripción",
+        "residuo",
+        "entry official name (en)",
+        "entry official name",
+        "capitulo oficial sinader (es)",
+        "subchapter official name (en)",
+    ]
+    declarable_col = None
+    declarable_candidates = [
+        "declarable en sinader?",
+        "¿declarable en sinader?",
+        "declarable en sinader",
+    ]
+    for candidate in code_candidates:
+        if candidate in normalized_cols:
+            code_col = normalized_cols[candidate]
+            break
+    for candidate in desc_candidates:
+        if candidate in normalized_cols:
+            desc_col = normalized_cols[candidate]
+            break
+    for candidate in declarable_candidates:
+        if candidate in normalized_cols:
+            declarable_col = normalized_cols[candidate]
+            break
+    if not code_col or not desc_col:
+        return {}
+    catalog: Dict[str, List[str]] = {}
+    required_cols = [code_col, desc_col] + ([declarable_col] if declarable_col else [])
+    for _, row in df[required_cols].dropna(subset=[code_col, desc_col]).iterrows():
+        if declarable_col:
+            declarable_value = _norm(_clean_cell(row.get(declarable_col, "")))
+            if declarable_value and declarable_value not in {"si", "sí", "s", "yes", "true"}:
+                continue
+        code = _normalize_code(row[code_col])
+        desc = _clean_cell(row[desc_col])
+        if not code or not desc:
+            continue
+        catalog.setdefault(code, [])
+        if desc not in catalog[code]:
+            catalog[code].append(desc)
+    return catalog
+
+
+def load_residuo_catalog(catalog_path: Optional[str] = None) -> Dict[str, List[str]]:
+    configured_path = (catalog_path or os.getenv("SINADER_CATALOG_PATH", "")).strip()
+    candidate_paths = [Path(configured_path)] if configured_path else []
+    candidate_paths.append(DEFAULT_CATALOG_PATH)
+    for path in candidate_paths:
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            excel_file = pd.ExcelFile(path)
+            sheet_candidates = [s for s in PREFERRED_CATALOG_SHEETS if s in excel_file.sheet_names]
+            sheet_candidates.extend([s for s in excel_file.sheet_names if s not in sheet_candidates])
+            for sheet_name in sheet_candidates:
+                df = pd.read_excel(path, sheet_name=sheet_name)
+                catalog = _build_catalog_from_dataframe(df)
+                if catalog:
+                    logger.info("Catálogo SINADER cargado desde %s (hoja=%s, códigos=%s)", path, sheet_name, len(catalog))
+                    return catalog
+            logger.warning("Catálogo SINADER en %s no tiene columnas válidas de código/descripcion", path)
+        except Exception as exc:
+            logger.warning("No se pudo cargar catálogo SINADER en %s: %s", path, exc)
+    return MASTER_RESIDUOS
+
+
+def _build_treatment_defra_map_from_dataframe(df: pd.DataFrame) -> Dict[str, str]:
+    if df.empty:
+        return {}
+    normalized_cols = {_norm(c): c for c in df.columns}
+    defra_col = None
+    treatment_col = None
+    defra_candidates = [
+        "defra",
+        "nombre defra",
+        "nombre defra (lista 1 exacta)",
+        "defra name",
+    ]
+    treatment_candidates = [
+        "tratamiento sinader",
+        "tratamiento",
+        "tratamiento sinader (es)",
+        "tipo tratamiento",
+        "sinader",
+    ]
+    for candidate in defra_candidates:
+        if candidate in normalized_cols:
+            defra_col = normalized_cols[candidate]
+            break
+    for candidate in treatment_candidates:
+        if candidate in normalized_cols:
+            treatment_col = normalized_cols[candidate]
+            break
+    if not defra_col or not treatment_col:
+        cols = list(df.columns[:2])
+        if len(cols) >= 2:
+            defra_col, treatment_col = cols[0], cols[1]
+        else:
+            return {}
+    mapping: Dict[str, str] = {}
+    for _, row in df[[defra_col, treatment_col]].dropna(how="any").iterrows():
+        defra_name = _clean_cell(row[defra_col])
+        treatment_name = _norm(_clean_cell(row[treatment_col]))
+        if not defra_name or not treatment_name:
+            continue
+        mapping[treatment_name] = defra_name
+    return mapping
+
+
+def load_treatment_defra_map(catalog_path: Optional[str] = None) -> Dict[str, str]:
+    configured_path = (catalog_path or os.getenv("SINADER_CATALOG_PATH", "")).strip()
+    candidate_paths = [Path(configured_path)] if configured_path else []
+    candidate_paths.append(DEFAULT_CATALOG_PATH)
+    for path in candidate_paths:
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            excel_file = pd.ExcelFile(path)
+            if TREATMENT_CATALOG_SHEET not in excel_file.sheet_names:
+                continue
+            df = pd.read_excel(path, sheet_name=TREATMENT_CATALOG_SHEET)
+            mapping = _build_treatment_defra_map_from_dataframe(df)
+            if mapping:
+                logger.info("Mapa Tratamiento->DEFRA cargado desde %s (hoja=%s, filas=%s)", path, TREATMENT_CATALOG_SHEET, len(mapping))
+                return mapping
+        except Exception as exc:
+            logger.warning("No se pudo cargar mapa de tratamientos SINADER en %s: %s", path, exc)
+    return dict(DEFAULT_TREATMENT_DEFRA_MAP)
+
+
+def load_treatment_level3_terms(catalog_path: Optional[str] = None) -> List[str]:
+    configured_path = (catalog_path or os.getenv("SINADER_CATALOG_PATH", "")).strip()
+    candidate_paths = [Path(configured_path)] if configured_path else []
+    candidate_paths.append(DEFAULT_CATALOG_PATH)
+    for path in candidate_paths:
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            excel_file = pd.ExcelFile(path)
+            if TREATMENT_CATALOG_SHEET not in excel_file.sheet_names:
+                continue
+            df = pd.read_excel(path, sheet_name=TREATMENT_CATALOG_SHEET)
+            normalized_cols = {_norm(c): c for c in df.columns}
+            level3_col = None
+            for candidate in ["nivel 3", "nivel3", "level 3", "tratamiento", "treatment"]:
+                if candidate in normalized_cols:
+                    level3_col = normalized_cols[candidate]
+                    break
+            if not level3_col:
+                continue
+            values = []
+            for value in df[level3_col].dropna().tolist():
+                text = _clean_cell(value)
+                if text:
+                    values.append(text)
+            unique_values = sorted(set(values), key=lambda x: len(x), reverse=True)
+            if unique_values:
+                logger.info("Tratamientos Nivel 3 cargados desde %s (hoja=%s, filas=%s)", path, TREATMENT_CATALOG_SHEET, len(unique_values))
+                return unique_values
+        except Exception as exc:
+            logger.warning("No se pudo cargar tratamientos Nivel 3 desde %s: %s", path, exc)
+    return []
+
+
+def map_treatment_to_defra(tratamiento: str, treatment_map: Dict[str, str]) -> str:
+    normalized_treatment = _norm(tratamiento)
+    if not normalized_treatment:
+        return ""
+    if normalized_treatment in treatment_map:
+        return treatment_map[normalized_treatment]
+    for key, defra_value in treatment_map.items():
+        if key in normalized_treatment:
+            return defra_value
+    return ""
+
+
+def choose_canonical_treatment(extracted_treatment: str, known_treatments: List[str], threshold: float = 0.58) -> str:
+    raw = _clean_cell(extracted_treatment)
+    if not raw or not known_treatments:
+        return raw
+    a = _normalize_for_match(raw)
+    if not a:
+        return raw
+    best_term = raw
+    best_score = 0.0
+    for term in known_treatments:
+        b = _normalize_for_match(term)
+        if not b:
+            continue
+        score = 1.0 if (a in b or b in a) else SequenceMatcher(None, a, b).ratio()
+        if score > best_score:
+            best_score = score
+            best_term = term
+    return best_term if best_score >= threshold else raw
+
+
+def load_treatment_alias_map(training_files: Optional[List[str]] = None) -> Dict[str, str]:
+    files = training_files or sorted(glob.glob(DEFAULT_TREATMENT_TRAINING_GLOB))
+    alias_map: Dict[str, str] = {}
+    for file_path in files:
+        try:
+            df = pd.read_excel(file_path)
+        except Exception:
+            continue
+        if df.empty:
+            continue
+        normalized_cols = {_norm(c): c for c in df.columns}
+        extracted_col = None
+        expected_col = None
+        extracted_candidates = ["tratamiento", "tratamiento actual", "tratamiento extraido", "tratamiento extraído"]
+        expected_candidates = ["tratamiento esperado", "esperado tratamiento", "tratamiento objetivo", "tratamiento correcto"]
+        for c in extracted_candidates:
+            if c in normalized_cols:
+                extracted_col = normalized_cols[c]
+                break
+        for c in expected_candidates:
+            if c in normalized_cols:
+                expected_col = normalized_cols[c]
+                break
+        if not extracted_col or not expected_col:
+            continue
+        for _, row in df[[extracted_col, expected_col]].dropna(how="any").iterrows():
+            src = _norm(_clean_cell(row[extracted_col]))
+            dst = _clean_cell(row[expected_col])
+            if src and dst:
+                alias_map[src] = dst
+    if alias_map:
+        logger.info("Mapa de alias de tratamiento cargado desde salidas históricas (%s reglas)", len(alias_map))
+    return alias_map
+
+
+def apply_residuo_dictionary_correction(df: pd.DataFrame, catalog: Dict[str, List[str]]) -> pd.DataFrame:
     if "Descripción Residuo" not in df.columns or "Código principal" not in df.columns:
         return df
     df = df.copy()
     if "Descripción Residuo Original" not in df.columns:
         df["Descripción Residuo Original"] = df["Descripción Residuo"]
-    df["Descripción Residuo"] = df.apply(lambda r: choose_canonical_description(r.get("Descripción Residuo", ""), r.get("Código principal", ""), MASTER_RESIDUOS), axis=1)
+    df["Código principal"] = df["Código principal"].apply(_normalize_code)
+    df["Descripción Residuo"] = df.apply(
+        lambda r: choose_canonical_description(
+            r.get("Descripción Residuo", ""),
+            r.get("Código principal", ""),
+            catalog,
+        ),
+        axis=1,
+    )
     return df
 
 
@@ -484,8 +1309,22 @@ def defra_classification(desc_residuo: str, sin_movimientos: str = "", codigo_pr
         return "Plastics: average plastic rigid"
     if cod == "02 01 99":
         return "Organic: mixed food and garden waste"
+    if cod == "02 01 02":
+        return "Organic: food and drink waste"
+    if cod == "02 02 02":
+        return "Organic: food and drink waste"
+    if cod == "02 02 03":
+        return "Organic: food and drink waste"
     if cod == "02 02 04":
         return "Organic: food and drink waste"
+    if cod == "20 01 39":
+        return "Plastics: average plastics"
+    if cod == "15 01 06":
+        return "Commercial and industrial waste"
+    if cod == "21 07 09":
+        return "Organic: mixed food and garden waste"
+    if cod == "21 07 01":
+        return "Organic: mixed food and garden waste"
     if cod == "19 08 05":
         return "Commercial and industrial waste"
     if cod == "20 01 99":
@@ -562,26 +1401,187 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
         "RUT Titular", "Realizado por", "Tipo", "Estado", "Código identificador", "Región", "Comuna",
         "Sin movimientos", "N.", "Descripción Residuo", "Descripción Residuo Original", "Código principal",
         "Peligrosidad", "Cantidad (Kg)", "Tratamiento", "Destino", "Transportista", "Patente",
-        "Contenedor", "Estado contenedor", "DEFRA",
+        "Contenedor", "Estado contenedor", "Texto fila original", "Parsing_OK", "Tratamiento_confiable", "Destino_confiable", "DEFRA_base", "DEFRA", "DEFRA_source", "DEFRA_confiable",
     ]
     cols = [c for c in preferred_cols if c in df.columns] + [c for c in df.columns if c not in preferred_cols]
     df = df[cols] if not df.empty else pd.DataFrame(columns=preferred_cols)
     if "Cantidad (Kg)" in df.columns:
         df["Cantidad (Kg)"] = df["Cantidad (Kg)"].apply(_to_float_kg)
-    df = apply_residuo_dictionary_correction(df)
+    catalog = load_residuo_catalog()
+    df = apply_residuo_dictionary_correction(df, catalog)
+    known_treatments = load_treatment_level3_terms()
+    treatment_alias_map = load_treatment_alias_map()
+    if "Tratamiento" in df.columns and known_treatments:
+        if "Tratamiento Original" not in df.columns:
+            df["Tratamiento Original"] = df["Tratamiento"]
+        df["Tratamiento"] = df["Tratamiento"].apply(
+            lambda x: treatment_alias_map.get(_norm(_clean_cell(x)), choose_canonical_treatment(x, known_treatments))
+        )
+    treatment_defra_map = load_treatment_defra_map()
     if "DEFRA" not in df.columns:
         df["DEFRA"] = ""
-    df["DEFRA"] = df.apply(
+    if "DEFRA_source" not in df.columns:
+        df["DEFRA_source"] = ""
+    if "DEFRA_confiable" not in df.columns:
+        df["DEFRA_confiable"] = "NO"
+    df["DEFRA_base"] = df.apply(
         lambda r: defra_classification(
             desc_residuo=r.get("Descripción Residuo", ""),
             sin_movimientos=r.get("Sin movimientos", ""),
             codigo_principal=r.get("Código principal", ""),
-            tratamiento=r.get("Tratamiento", ""),
-            destino=r.get("Destino", ""),
+            tratamiento="",
+            destino="",
         ),
         axis=1,
+    )
+    df["DEFRA"] = df["DEFRA_base"]
+    df["DEFRA_source"] = df["DEFRA_base"].apply(lambda x: "heredada_base" if _clean_cell(x) else "sin_clasificar")
+    if "Tratamiento" in df.columns:
+        def _treatment_is_reliable(row) -> bool:
+            t = _norm(_clean_cell(row.get("Tratamiento", "")))
+            txt = _norm(_clean_cell(row.get("Texto fila original", "")))
+            flag = _norm(_clean_cell(row.get("Tratamiento_confiable", "no")))
+            if flag not in {"si", "yes", "true"}:
+                return False
+            if not t:
+                return False
+            bad_tokens = ["cantidad residuo", "tipo tratamiento destino", "transportista patente", "destino transportista"]
+            if any(b in t for b in bad_tokens):
+                return False
+            if any(b in txt for b in bad_tokens):
+                return False
+            return True
+
+        def _resolve_defra(row: pd.Series) -> Tuple[str, str]:
+            base_value = _clean_cell(row.get("DEFRA_base", ""))
+            treatment_value = _clean_cell(row.get("Tratamiento", ""))
+            code_value = _clean_cell(row.get("Código principal", ""))
+            desc_value = _clean_cell(row.get("Descripción Residuo", ""))
+            destination_value = _clean_cell(row.get("Destino", ""))
+            if _treatment_is_reliable(row):
+                mapped = _clean_cell(map_treatment_to_defra(treatment_value, treatment_defra_map))
+                if mapped:
+                    return mapped, "ajustada_tratamiento"
+            contextual = _clean_cell(defra_classification(
+                desc_residuo=desc_value,
+                sin_movimientos=row.get("Sin movimientos", ""),
+                codigo_principal=code_value,
+                tratamiento=treatment_value if _treatment_is_reliable(row) else "",
+                destino=destination_value,
+            ))
+            if contextual:
+                if contextual == base_value:
+                    return contextual, "heredada_base"
+                return contextual, "ajustada_regla_codigo"
+            if base_value:
+                return base_value, "heredada_base"
+            return "", "sin_clasificar"
+
+        resolved = df.apply(_resolve_defra, axis=1)
+        df["DEFRA"] = resolved.apply(lambda x: x[0])
+        df["DEFRA_source"] = resolved.apply(lambda x: x[1])
+    df["DEFRA_confiable"] = df["DEFRA_source"].apply(
+        lambda x: "SI" if _clean_cell(x) in {"heredada_base", "ajustada_tratamiento", "ajustada_regla_codigo"} else "NO"
     )
     Path(output_excel).parent.mkdir(parents=True, exist_ok=True)
     df.to_excel(output_excel, index=False)
     logger.info("Excel generado: %s | filas=%s", output_excel, len(df))
     return df
+
+
+def summarize_parsing_quality(df: pd.DataFrame, known_treatments: Optional[List[str]] = None) -> Dict[str, int]:
+    if df is None or df.empty:
+        return {
+            "rows_total": 0,
+            "rows_parsing_no": 0,
+            "rows_destino_contaminado": 0,
+            "rows_tratamiento_fuera_catalogo": 0,
+            "rows_defra_vacia": 0,
+            "rows_defra_distinta_base": 0,
+        }
+    known_treatments = known_treatments or load_treatment_level3_terms() or STRONG_TREATMENT_CATALOG
+    known_treatment_norm = {_norm(t) for t in known_treatments if _clean_cell(t)}
+    forbidden_dst = [_norm(x) for x in DESTINATION_NOISE_FRAGMENTS]
+    forbidden_trt = [_norm(x) for x in TREATMENT_NOISE_FRAGMENTS]
+
+    def _dst_contaminated(row: pd.Series) -> bool:
+        dst = _norm(_clean_cell(row.get("Destino", "")))
+        if not dst:
+            return False
+        if any(f and f in dst for f in forbidden_dst):
+            return True
+        desc = _norm(_clean_cell(row.get("Descripción Residuo", "")))
+        desc_tokens = [tok for tok in desc.split() if len(tok) >= 8]
+        return sum(1 for tok in desc_tokens if tok in dst) >= 2
+
+    def _trt_outside_catalog(row: pd.Series) -> bool:
+        trt = _norm(_clean_cell(row.get("Tratamiento", "")))
+        if not trt:
+            return False
+        if any(f and f in trt for f in forbidden_trt):
+            return True
+        return trt not in known_treatment_norm
+
+    return {
+        "rows_total": int(len(df)),
+        "rows_parsing_no": int((df.get("Parsing_OK", pd.Series(dtype=str)).fillna("NO").astype(str).str.upper() != "SI").sum()),
+        "rows_destino_contaminado": int(df.apply(_dst_contaminated, axis=1).sum()),
+        "rows_tratamiento_fuera_catalogo": int(df.apply(_trt_outside_catalog, axis=1).sum()),
+        "rows_defra_vacia": int((df.get("DEFRA", pd.Series(dtype=str)).fillna("").astype(str).str.strip() == "").sum()),
+        "rows_defra_distinta_base": int((df.get("DEFRA", pd.Series(dtype=str)).fillna("").astype(str).str.strip() != df.get("DEFRA_base", pd.Series(dtype=str)).fillna("").astype(str).str.strip()).sum()),
+    }
+
+
+def _selfcheck_reconstruction_samples() -> Dict[str, bool]:
+    sample_lines = [
+        "Residuo Cantidad (kg) Tipo Tratamiento Destino Transportista Patente",
+        "02 02 04 | Lodos del tratamiento in",
+        "situ de efluentes 26450 kg Degradación",
+        "Anaeróbica ECOPRIAL 1|",
+        "19 08 05 | Lodos del tratamiento de aguas residuales urbanas 84180 kg Recepción de Lodos en PTAS PLANTA DE TRATAMIENTO DE AGUAS SERVIDAS DE CASTRO 1|",
+        "15 01 01 | Envases de papel y cartón 165 kg Reciclaje de papel, cartón y productos de papel ECOFIBRAS SUCURSAL PUERTO MONTT 1|",
+        "10 01 01 | Cenizas del hogar 4260 kg Sitio de Escombros de la Construcción ESCOMBRERA TRESOL 1|",
+        "20 01 99 | Otras fracciones no especificadas en otra categoría 4210 kg Relleno sanitario CONSORCIO COLLIPULLI 1|",
+        "21 04 04 | Residuos de plásticos (HDPE, PEE, PETE, PVC) excepto planzas, boyas, flotadores, redes y cabos 29756 kg Reciclaje de plásticos PLASTICOS DEL SUR SPA 1|",
+        "02 01 99 | Residuos no especificados en otra categoría 8620 kg Compostaje Centro Crucero 1|",
+        "02 02 03 | Subproductos hidrobiológicos 9000 kg Reciclaje de residuos hidrobiológicos para consumo animal SALMONOIL S.A. 1|",
+        "20 01 39 | Plásticos mixtos 1450 kg Pretratamiento de plásticos REPLACAR 1|",
+        "15 01 06 | Residuos mixtos 3400 kg Residuos municipales asimilables a domiciliarios Estación de transferencia 1|",
+        "15 01 06 | Residuos mixtos 900 kg Disposición final ECOBIO 1|",
+        "21 07 09 | Biosólidos 700 kg Compostaje Cancha compostaje Los Rebalses del Sur 1|",
+    ]
+    blocks = _reconstruct_row_blocks_from_lines(sample_lines)
+    parsed = [_parse_reconstructed_row_block(b, STRONG_TREATMENT_CATALOG) for b in blocks]
+    parsed = [p for p in parsed if p]
+    p_by_code = {p["Código principal"]: p for p in parsed}
+    return {
+        "multiline_row_reconstructed": len(parsed) >= 5 and p_by_code.get("02 02 04", {}).get("Tratamiento") == "Degradación Anaeróbica",
+        "code_desc_qty_split": bool(parsed and parsed[0]["Descripción Residuo"] and parsed[0]["Cantidad (Kg)"]),
+        "cross_page_like_continuity": len(blocks) >= 5,
+        "header_line_filtered": all("residuo cantidad" not in _norm(p.get("Texto fila original", "")) for p in parsed),
+        "known_cases_treatment_destination": (
+            p_by_code.get("19 08 05", {}).get("Tratamiento") == "Recepción de Lodos en PTAS"
+            and "PLANTA DE TRATAMIENTO" in p_by_code.get("19 08 05", {}).get("Destino", "")
+            and p_by_code.get("15 01 01", {}).get("Tratamiento") == "Reciclaje de papel, cartón y productos de papel"
+            and "ECOFIBRAS SUCURSAL PUERTO MONTT" in p_by_code.get("15 01 01", {}).get("Destino", "")
+            and p_by_code.get("10 01 01", {}).get("Tratamiento") == "Sitio de Escombros de la Construcción"
+            and "ESCOMBRERA TRESOL" in p_by_code.get("10 01 01", {}).get("Destino", "")
+            and p_by_code.get("20 01 99", {}).get("Tratamiento") == "Relleno sanitario"
+            and "CONSORCIO COLLIPULLI" in p_by_code.get("20 01 99", {}).get("Destino", "")
+            and p_by_code.get("21 04 04", {}).get("Destino") == "PLASTICOS DEL SUR SPA"
+            and _norm(p_by_code.get("02 01 99", {}).get("Destino", "")) == _norm("Centro Crucero")
+            and p_by_code.get("02 02 03", {}).get("Tratamiento") == "Reciclaje de residuos hidrobiológicos para consumo animal"
+            and p_by_code.get("20 01 39", {}).get("Destino") == "REPLACAR"
+            and _norm(p_by_code.get("15 01 06", {}).get("Destino", "")) in {_norm("Estación de transferencia"), _norm("ECOBIO")}
+            and _norm(p_by_code.get("21 07 09", {}).get("Destino", "")) in {
+                _norm("CANCHA COMPOSTAJE LOS REBALSES DEL SUR"),
+                _norm("CANCHA LOS REBALSES DEL SUR"),
+            }
+        ),
+        "confidence_flags_working": (
+            p_by_code.get("19 08 05", {}).get("Tratamiento_confiable") == "SI"
+            and p_by_code.get("19 08 05", {}).get("Destino_confiable") == "SI"
+            and p_by_code.get("15 01 01", {}).get("Tratamiento_confiable") == "SI"
+            and p_by_code.get("10 01 01", {}).get("Destino_confiable") == "SI"
+        ),
+    }
