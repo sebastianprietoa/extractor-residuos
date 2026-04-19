@@ -1301,6 +1301,59 @@ def map_treatment_to_defra(tratamiento: str, treatment_map: Dict[str, str]) -> s
             return defra_value
     return ""
 
+def choose_canonical_treatment(extracted_treatment: str, known_treatments: List[str], threshold: float = 0.58) -> str:
+    raw = _clean_cell(extracted_treatment)
+    if not raw or not known_treatments:
+        return raw
+    a = _normalize_for_match(raw)
+    if not a:
+        return raw
+    best_term = raw
+    best_score = 0.0
+    for term in known_treatments:
+        b = _normalize_for_match(term)
+        if not b:
+            continue
+        score = 1.0 if (a in b or b in a) else SequenceMatcher(None, a, b).ratio()
+        if score > best_score:
+            best_score = score
+            best_term = term
+    return best_term if best_score >= threshold else raw
+
+
+def load_treatment_alias_map(training_files: Optional[List[str]] = None) -> Dict[str, str]:
+    files = training_files or sorted(glob.glob(DEFAULT_TREATMENT_TRAINING_GLOB))
+    alias_map: Dict[str, str] = {}
+    for file_path in files:
+        try:
+            df = pd.read_excel(file_path)
+        except Exception:
+            continue
+        if df.empty:
+            continue
+        normalized_cols = {_norm(c): c for c in df.columns}
+        extracted_col = None
+        expected_col = None
+        extracted_candidates = ["tratamiento", "tratamiento actual", "tratamiento extraido", "tratamiento extraído"]
+        expected_candidates = ["tratamiento esperado", "esperado tratamiento", "tratamiento objetivo", "tratamiento correcto"]
+        for c in extracted_candidates:
+            if c in normalized_cols:
+                extracted_col = normalized_cols[c]
+                break
+        for c in expected_candidates:
+            if c in normalized_cols:
+                expected_col = normalized_cols[c]
+                break
+        if not extracted_col or not expected_col:
+            continue
+        for _, row in df[[extracted_col, expected_col]].dropna(how="any").iterrows():
+            src = _norm(_clean_cell(row[extracted_col]))
+            dst = _clean_cell(row[expected_col])
+            if src and dst:
+                alias_map[src] = dst
+    if alias_map:
+        logger.info("Mapa de alias de tratamiento cargado desde salidas históricas (%s reglas)", len(alias_map))
+    return alias_map
 
 def choose_canonical_treatment(extracted_treatment: str, known_treatments: List[str], threshold: float = 0.58) -> str:
     raw = _clean_cell(extracted_treatment)
@@ -1517,6 +1570,8 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
     ]
     cols = [c for c in preferred_cols if c in df.columns] + [c for c in df.columns if c not in preferred_cols]
     df = df[cols] if not df.empty else pd.DataFrame(columns=preferred_cols)
+    if not df.empty and df.columns.duplicated().any():
+        df = df.loc[:, ~df.columns.duplicated()].copy()
     if "Cantidad (Kg)" in df.columns:
         df["Cantidad (Kg)"] = df["Cantidad (Kg)"].apply(_to_float_kg)
     catalog = load_residuo_catalog()
