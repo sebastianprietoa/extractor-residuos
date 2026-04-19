@@ -823,7 +823,7 @@ def extract_text_from_cell_bboxes(page, img_bgr, row_cell_bboxes, scale_x, scale
 
 def parse_sinader_table_from_cells(cell_rows, known_treatments: Optional[List[str]] = None):
     rows_out = []
-    for row_cells in cell_rows:
+    for row_idx, row_cells in enumerate(cell_rows):
         if not row_cells:
             continue
         used = [_clean_cell(c.get("used", "")) for c in row_cells]
@@ -861,6 +861,15 @@ def parse_sinader_table_from_cells(cell_rows, known_treatments: Optional[List[st
         parsing_ok = bool(code_ok and qty_ok and (trt_ok or dst_ok))
 
         if code or desc or qty or trt or dst:
+            confidence_reasons = []
+            if not code_ok:
+                confidence_reasons.append("code")
+            if not qty_ok:
+                confidence_reasons.append("qty")
+            if not trt_ok:
+                confidence_reasons.append("trt")
+            if not dst_ok:
+                confidence_reasons.append("dst")
             rows_out.append({
                 "Código principal": code,
                 "Descripción Residuo": desc,
@@ -876,6 +885,8 @@ def parse_sinader_table_from_cells(cell_rows, known_treatments: Optional[List[st
                 "Parsing_OK": "SI" if parsing_ok else "NO",
                 "Tratamiento_confiable": "SI" if trt_ok else "NO",
                 "Destino_confiable": "SI" if dst_ok else "NO",
+                "_row_index": row_idx,
+                "_cell_confidence_reason": ",".join(confidence_reasons),
             })
     return rows_out
 
@@ -1003,23 +1014,55 @@ def parse_sinader_rows_visual_segmented(pdf_path: str) -> List[Dict[str, str]]:
             cell_debug_rows: List[List[Dict[str, str]]] = []
             accepted_cell_rows = 0
             rejected_cell_rows = 0
+            fallback_rows_used = 0
             if column_bounds and len(column_bounds) >= 7:
                 row_cells = build_cell_bboxes(row_boxes, column_bounds)
                 cell_rows = extract_text_from_cell_bboxes(page, img_bgr, row_cells, scale_x, scale_y, page_is_pdfplumber=(doc is None))
                 cell_debug_rows = cell_rows
                 parsed_from_cells = parse_sinader_table_from_cells(cell_rows, known_treatments)
-                # Criterio de aceptación: código + cantidad + texto razonable en columnas principales
+                # Criterio estricto de aceptación por celdas:
+                # - código y cantidad válidos
+                # - Parsing_OK afirmativo
+                # - al menos una señal confiable (tratamiento/destino)
+                # Si una fila queda dudosa, se fuerza fallback por fila (no se acepta por celdas).
+                rejected_row_indexes = set()
                 for r in parsed_from_cells:
                     code_ok = bool(re.match(r"^\d{2}\s+\d{2}\s+\d{2}$", _clean_cell(r.get("Código principal", ""))))
                     qty_ok = _to_float_kg(r.get("Cantidad (Kg)", "")) is not None
-                    trt_txt = _clean_cell(r.get("Tratamiento", ""))
-                    dst_txt = _clean_cell(r.get("Destino", ""))
-                    if code_ok and qty_ok and (trt_txt or dst_txt):
+                    parsing_ok = _norm(_clean_cell(r.get("Parsing_OK", ""))) in {"si", "yes", "true"}
+                    trt_ok = _norm(_clean_cell(r.get("Tratamiento_confiable", ""))) in {"si", "yes", "true"}
+                    dst_ok = _norm(_clean_cell(r.get("Destino_confiable", ""))) in {"si", "yes", "true"}
+                    row_idx = int(r.get("_row_index", -1))
+                    if code_ok and qty_ok and parsing_ok and (trt_ok or dst_ok):
                         r["Row_strategy"] = "cells_primary"
+                        r.pop("_row_index", None)
+                        r.pop("_cell_confidence_reason", None)
                         parsed_rows.append(r)
                         accepted_cell_rows += 1
                     else:
                         rejected_cell_rows += 1
+                        if row_idx >= 0:
+                            rejected_row_indexes.add(row_idx)
+
+                for row_idx in sorted(rejected_row_indexes):
+                    if row_idx >= len(row_boxes):
+                        continue
+                    bbox_img = row_boxes[row_idx]
+                    text_native = extract_pdf_text_from_bbox(page, bbox_img, scale_x, scale_y, page_is_pdfplumber=(doc is None))
+                    text_used = text_native
+                    text_ocr = ""
+                    if _row_text_is_incoherent(text_native):
+                        text_ocr = ocr_text_from_bbox(img_bgr, bbox_img)
+                        if text_ocr and (not text_native or len(text_ocr) > len(text_native) * 0.7):
+                            text_used = text_ocr
+                    row_debug_texts.append({"native": text_native, "ocr": text_ocr, "used": text_used})
+                    parsed = _parse_reconstructed_row_block(text_used, known_treatments)
+                    if parsed:
+                        parsed["Texto fila original"] = text_used
+                        parsed["Row_strategy"] = "row_visual_fallback"
+                        parsed_rows.append(parsed)
+                        fallback_rows_used += 1
+
             if not parsed_rows:
                 for bbox_img in row_boxes:
                     text_native = extract_pdf_text_from_bbox(page, bbox_img, scale_x, scale_y, page_is_pdfplumber=(doc is None))
@@ -1035,6 +1078,7 @@ def parse_sinader_rows_visual_segmented(pdf_path: str) -> List[Dict[str, str]]:
                         parsed["Texto fila original"] = text_used
                         parsed["Row_strategy"] = "row_visual_fallback"
                         parsed_rows.append(parsed)
+                        fallback_rows_used += 1
             rows_out.extend(parsed_rows)
             if debug_dir is not None:
                 _save_visual_debug_page(
@@ -1050,6 +1094,7 @@ def parse_sinader_rows_visual_segmented(pdf_path: str) -> List[Dict[str, str]]:
                 page_extra = {
                     "cells_accepted": accepted_cell_rows,
                     "cells_rejected": rejected_cell_rows,
+                    "rows_fallback_used": fallback_rows_used,
                     "rows_final": len(parsed_rows),
                 }
                 (debug_dir / f"page_{page_index+1:02d}_row_strategy.json").write_text(json.dumps(page_extra, ensure_ascii=False, indent=2), encoding="utf-8")
