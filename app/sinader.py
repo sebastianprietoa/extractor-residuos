@@ -1363,28 +1363,36 @@ def extract_sinader_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[
         }], meta
     rows_from_tables = parse_sinader_rows_from_tables(pdf_path)
     rows_from_text = parse_sinader_rows_from_text(full_text)
-    rows_from_hybrid = parse_sinader_rows_hybrid(pdf_path)
 
-    def _score_rows(rows: List[Dict[str, str]]) -> tuple[float, int]:
+    def _score_rows(rows: List[Dict[str, str]]) -> tuple[float, int, int]:
         if not rows:
-            return (-9999.0, 0)
+            return (-9999.0, 0, 0)
         score = 0.0
+        strong_rows = 0
         for r in rows:
             code = _clean_cell(r.get("Código principal", ""))
             qty = _clean_cell(r.get("Cantidad (Kg)", ""))
             desc = _clean_cell(r.get("Descripción Residuo", ""))
             dst = _clean_cell(r.get("Destino", ""))
             trt = _clean_cell(r.get("Tratamiento", ""))
+            code_ok = bool(re.match(r"^\d{2}\s+\d{2}\s+\d{2}$", code))
+            qty_ok = _to_float_kg(qty) is not None
+            desc_ok = bool(desc and len(desc) >= 8)
+            if code_ok and qty_ok and desc_ok:
+                strong_rows += 1
+                score += 4.0
             if re.match(r"^\d{2}\s+\d{2}\s+\d{2}$", code):
-                score += 2.5
+                score += 3.0
             if _to_float_kg(qty) is not None:
-                score += 2.0
+                score += 2.5
+            if desc_ok:
+                score += 2.2
             if _norm(_clean_cell(r.get("Parsing_OK", ""))) in {"si", "yes", "true"}:
-                score += 2.0
+                score += 1.5
             if _norm(_clean_cell(r.get("Tratamiento_confiable", ""))) in {"si", "yes", "true"}:
-                score += 1.2
+                score += 0.4
             if _norm(_clean_cell(r.get("Destino_confiable", ""))) in {"si", "yes", "true"}:
-                score += 1.2
+                score += 0.4
             dst_norm = _norm(dst)
             trt_norm = _norm(trt)
             if any(_norm(f) in dst_norm for f in DESTINATION_NOISE_FRAGMENTS):
@@ -1396,10 +1404,23 @@ def extract_sinader_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[
                 score -= 2.0
             if trt_norm and sum(1 for t in desc_tokens if t in trt_norm) >= 2:
                 score -= 2.0
-        return (score, len(rows))
+        return (score, strong_rows, len(rows))
 
-    candidates = [("tables", rows_from_tables), ("text", rows_from_text), ("visual", rows_from_hybrid)]
-    method, detail_rows = max(candidates, key=lambda x: _score_rows(x[1]))
+    base_candidates = [("tables", rows_from_tables), ("text", rows_from_text)]
+    method, detail_rows = max(base_candidates, key=lambda x: _score_rows(x[1]))
+    base_score, base_strong, base_total = _score_rows(detail_rows)
+    base_ok = bool(detail_rows) and (base_strong >= max(2, int(0.5 * max(1, base_total))))
+
+    if not base_ok:
+        rows_from_hybrid = parse_sinader_rows_hybrid(pdf_path)
+        visual_score, visual_strong, visual_total = _score_rows(rows_from_hybrid)
+        visual_ok = bool(rows_from_hybrid) and (visual_strong >= max(2, int(0.5 * max(1, visual_total))))
+        # Estrategia visual solo como fallback cuando la base textual falla claramente.
+        if visual_ok or visual_score > (base_score + 8.0):
+            method, detail_rows = "visual_fallback", rows_from_hybrid
+        else:
+            method = f"{method}_base_low_confidence"
+
     if not detail_rows:
         relaxed_lines = [_clean_cell(x) for x in full_text.splitlines() if _clean_cell(x)]
         relaxed_blocks = _reconstruct_row_blocks_from_lines(relaxed_lines)
@@ -1407,7 +1428,15 @@ def extract_sinader_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[
         detail_rows = [p for p in (_parse_reconstructed_row_block(b, known_treatments_relaxed) for b in relaxed_blocks) if p]
         if detail_rows:
             method = "relaxed_text"
-    logger.info("Método SINADER seleccionado: %s (filas=%s, score=%.2f)", method, len(detail_rows), _score_rows(detail_rows)[0])
+    selected_score, selected_strong, selected_total = _score_rows(detail_rows)
+    logger.info(
+        "Método SINADER seleccionado: %s (filas=%s, score=%.2f, strong=%s/%s)",
+        method,
+        len(detail_rows),
+        selected_score,
+        selected_strong,
+        selected_total,
+    )
 
     known_treatments = load_treatment_level3_terms()
     global_treatment = extract_global_treatment_from_text(full_text, known_treatments)
@@ -1956,7 +1985,10 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
             t = _norm(_clean_cell(row.get("Tratamiento", "")))
             txt = _norm(_clean_cell(row.get("Texto fila original", "")))
             flag = _norm(_clean_cell(row.get("Tratamiento_confiable", "no")))
+            parsing_flag = _norm(_clean_cell(row.get("Parsing_OK", "no")))
             if flag not in {"si", "yes", "true"}:
+                return False
+            if parsing_flag not in {"si", "yes", "true"}:
                 return False
             if not t:
                 return False
@@ -1970,26 +2002,21 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
         def _resolve_defra(row: pd.Series) -> Tuple[str, str]:
             base_value = _clean_cell(row.get("DEFRA_base", ""))
             treatment_value = _clean_cell(row.get("Tratamiento", ""))
-            code_value = _clean_cell(row.get("Código principal", ""))
-            desc_value = _clean_cell(row.get("Descripción Residuo", ""))
-            destination_value = _clean_cell(row.get("Destino", ""))
             if _treatment_is_reliable(row):
                 mapped = _clean_cell(map_treatment_to_defra(treatment_value, treatment_defra_map))
                 if mapped:
                     return mapped, "ajustada_tratamiento"
-            contextual = _clean_cell(defra_classification(
-                desc_residuo=desc_value,
-                sin_movimientos=row.get("Sin movimientos", ""),
-                codigo_principal=code_value,
-                tratamiento=treatment_value if _treatment_is_reliable(row) else "",
-                destino=destination_value,
-            ))
-            if contextual:
-                if contextual == base_value:
-                    return contextual, "heredada_base"
-                return contextual, "ajustada_regla_codigo"
             if base_value:
                 return base_value, "heredada_base"
+            fallback = _clean_cell(defra_classification(
+                desc_residuo=row.get("Descripción Residuo", ""),
+                sin_movimientos=row.get("Sin movimientos", ""),
+                codigo_principal=row.get("Código principal", ""),
+                tratamiento="",
+                destino="",
+            ))
+            if fallback:
+                return fallback, "ajustada_regla_codigo"
             return "", "sin_clasificar"
 
         if df.columns.duplicated().any():
