@@ -329,7 +329,7 @@ def _extract_table_text_block(full_text: str) -> str:
 def _reconstruct_row_blocks_from_lines(lines: List[str]) -> List[str]:
     blocks: List[str] = []
     current: List[str] = []
-    ler_start = re.compile(r"^\s*\d{2}\s+\d{2}\s+\d{2}\s*\|")
+    ler_start = re.compile(r"^\s*\d{2}\s+\d{2}\s+\d{2}\b(?:\s*\|)?")
     header_noise = re.compile(r"^\s*(residuo|cantidad|tipo\s*tratamiento|tratamiento|destino|transportista|patente)\b", flags=re.IGNORECASE)
     for ln in lines:
         line = _clean_cell(ln)
@@ -458,11 +458,13 @@ def _parse_reconstructed_row_block(
     block = _clean_cell(block)
     if not block:
         return None
-    m_code = re.match(r"^\s*(\d{2}\s+\d{2}\s+\d{2})\s*\|\s*(.*)$", block)
+    m_code = re.match(r"^\s*(\d{2}\s+\d{2}\s+\d{2})\s*(?:\|\s*)?(.*)$", block)
     if not m_code:
         return None
     code = _clean_cell(m_code.group(1))
     rest = _clean_cell(m_code.group(2))
+    if not rest:
+        return None
     m_qty = re.search(r"(?P<qty>\d[\d\.,]*)\s*kg\b", rest, flags=re.IGNORECASE)
     if not m_qty:
         return {
@@ -1302,6 +1304,13 @@ def extract_sinader_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[
 
     candidates = [("tables", rows_from_tables), ("text", rows_from_text), ("visual", rows_from_hybrid)]
     method, detail_rows = max(candidates, key=lambda x: _score_rows(x[1]))
+    if not detail_rows:
+        relaxed_lines = [_clean_cell(x) for x in full_text.splitlines() if _clean_cell(x)]
+        relaxed_blocks = _reconstruct_row_blocks_from_lines(relaxed_lines)
+        known_treatments_relaxed = load_treatment_level3_terms()
+        detail_rows = [p for p in (_parse_reconstructed_row_block(b, known_treatments_relaxed) for b in relaxed_blocks) if p]
+        if detail_rows:
+            method = "relaxed_text"
     logger.info("Método SINADER seleccionado: %s (filas=%s, score=%.2f)", method, len(detail_rows), _score_rows(detail_rows)[0])
 
     known_treatments = load_treatment_level3_terms()
