@@ -148,6 +148,34 @@ KNOWN_SINADER_CODES = {
     "15 01 01", "15 01 02", "15 01 04", "20 01 99", "19 08 05", "10 01 01", "21 04 04", "02 02 04",
     "02 01 99", "02 01 02", "02 02 02", "02 02 03", "20 01 39", "15 01 06", "21 07 09", "21 07 01",
 }
+TRATAMIENTOS_CONOCIDOS_V2 = sorted([
+    "Reciclaje de papel, cartón y productos de papel",
+    "Residuos municipales asimilables a domiciliarios",
+    "Sitio de Escombros de la Construcción",
+    "Recepción de Lodos en PTAS",
+    "Degradación Anaeróbica",
+    "Reciclaje de plásticos",
+    "Reciclaje de metales",
+    "Disposición final",
+    "Relleno sanitario",
+    "Pretratamiento",
+    "Monorelleno",
+    "Compostaje",
+], key=len, reverse=True)
+MAPA_RESIDUOS_SINADER_V2 = {
+    "02 01 99": "Residuos no especificados en otra categoría",
+    "02 02 04": "Lodos del tratamiento in situ de efluentes",
+    "10 01 01": "Cenizas del hogar, escorias y polvo de caldera (excepto el polvo de caldera especificado en el código 10 01 04)",
+    "15 01 01": "Envases de papel y cartón",
+    "15 01 02": "Envases de plástico",
+    "15 01 04": "Envases metálicos",
+    "15 01 06": "Envases mezclados",
+    "19 08 05": "Lodos del tratamiento de aguas residuales urbanas",
+    "20 01 99": "Otras fracciones no especificadas en otra categoría",
+    "21 04 04": "Residuos de plásticos (HDPE, PEE, PETE, PVC) excepto planzas, boyas, flotadores, redes y cabos",
+    "21 07 01": "Residuos orgánicos (ejemplo como conchas, algas, carne, entre otros; incluye mortalidad)",
+    "21 07 09": "Lodos orgánicos (ejemplo fecas y alimento no consumido)",
+}
 
 
 def _strip_accents(s: str) -> str:
@@ -2180,13 +2208,28 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
             (df.get("Parsing_OK", pd.Series(dtype=str)).fillna("NO").astype(str).str.upper() != "SI")
             | (df.get("Tratamiento", pd.Series(dtype=str)).fillna("").astype(str).str.strip() == "")
         ),
-        "observacion": "",
+        "observacion": df.get("Parsing_OK", pd.Series(dtype=str)).fillna("NO").astype(str).str.upper().map(
+            {"SI": "", "NO": "Fila no parseada"}
+        ),
         "fila_original": df.get("Texto fila original", pd.Series(dtype=str)).fillna(""),
     })
+    df_v2.loc[df_v2["sin_movimientos"] == True, "observacion"] = "Período Sin Movimientos"
+    df_v2["metodo_usado"] = df_v2["metodo_usado"].where(
+        df_v2["metodo_usado"].astype(str).str.strip() != "",
+        df.get("_treatment_source", pd.Series(dtype=str)).fillna(""),
+    )
+    def _normalizar_tratamiento_v2(x: str) -> str:
+        txt = _clean_cell(x)
+        if not txt:
+            return ""
+        txt_norm = _norm(txt)
+        for t in TRATAMIENTOS_CONOCIDOS_V2:
+            if _norm(t) in txt_norm:
+                return t
+        return txt
+    df_v2["tratamiento"] = df_v2["tratamiento"].apply(_normalizar_tratamiento_v2)
     df_v2["residuo_extraido"] = df.get("Descripción Residuo Original", df_v2["residuo"]).fillna(df_v2["residuo"])
-    catalog_for_map = load_residuo_catalog() or MASTER_RESIDUOS
-    residuo_map = {k: (v[0] if isinstance(v, list) and v else "") for k, v in catalog_for_map.items()}
-    df_v2["residuo_oficial"] = df_v2["codigo_residuo"].map(lambda x: residuo_map.get(_normalize_code(x), ""))
+    df_v2["residuo_oficial"] = df_v2["codigo_residuo"].map(lambda x: MAPA_RESIDUOS_SINADER_V2.get(_normalize_code(x), ""))
     df_v2["residuo"] = df_v2["residuo_oficial"].where(df_v2["residuo_oficial"].astype(str).str.strip() != "", df_v2["residuo"])
     df_v2["codigo_sin_mapa_residuo"] = (
         df_v2["codigo_residuo"].astype(str).str.strip() != ""
