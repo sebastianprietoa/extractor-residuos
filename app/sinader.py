@@ -479,6 +479,13 @@ def _parse_reconstructed_row_block(
         known_treatments,
         desc,
     )
+    treatment_catalog_norm = {_norm(x) for x in (STRONG_TREATMENT_CATALOG + (known_treatments or []))}
+    known_destination_norm = {_norm(x) for x in KNOWN_DESTINATIONS}
+    trt_ok = bool(trt) and _norm(trt) in treatment_catalog_norm and _is_treatment_clean(trt, desc)
+    dst_ok = bool(dst) and (
+        _norm(dst) in known_destination_norm
+        or any(k in _norm(dst) for k in known_destination_norm if k)
+    ) and _is_destination_clean(dst, desc)
     qty_ok = _to_float_kg(qty) is not None
     code_ok = bool(code and re.match(r"^\d{2}\s+\d{2}\s+\d{2}$", code))
     semantic_ok = (trt_ok or dst_ok) and _is_destination_clean(dst, desc) and (not trt or _is_treatment_clean(trt, desc))
@@ -599,13 +606,21 @@ def _sanitize_treatment_and_logistics(
                     return term
         if "degradacion" in text_norm and "anaerobica" in text_norm:
             return "Degradación Anaeróbica"
+        if "anaerobica" in text_norm:
+            return "Degradación Anaeróbica"
         candidates = [
             r"relleno\s+sanitario",
             r"sitio\s+de\s+escombros\s+de\s+la\s+construcci[oó]n",
+            r"recepci[oó]n\s+de\s+lodos\s+en\s+ptas",
+            r"reciclaje\s+de\s+residuos\s+hidrobiol[oó]gicos\s+para\s+consumo\s+animal",
+            r"residuos\s+municipales\s+asimilables\s+a\s+domiciliarios",
             r"reciclaje\s+de\s+pl[aá]sticos",
             r"reciclaje\s+de\s+metales",
             r"reciclaje\s+de\s+papel(?:,\s*cart[oó]n\s*y\s*productos\s*de\s*papel)?",
             r"monorelleno",
+            r"disposici[oó]n\s+final",
+            r"pretratamiento\s+de\s+pl[aá]sticos",
+            r"pretratamiento",
             r"compostaje",
             r"reutilizaci[oó]n",
             r"combusti[oó]n",
@@ -636,8 +651,11 @@ def _sanitize_treatment_and_logistics(
                 kd_norm = _norm(known_dst)
                 if kd_norm and kd_norm in original_norm:
                     return known_dst
+            if "collipulli" in original_norm:
+                return "CONSORCIO COLLIPULLI"
             for frag in DESTINATION_NOISE_FRAGMENTS:
                 cleaned = re.sub(re.escape(frag), " ", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r"\bespecificad[ao]s?\b", " ", cleaned, flags=re.IGNORECASE)
             if descripcion:
                 desc_norm = _norm(descripcion)
                 for token in [t for t in desc_norm.split() if len(t) >= 7]:
@@ -650,6 +668,20 @@ def _sanitize_treatment_and_logistics(
                 kd_norm = _norm(known_dst)
                 if kd_norm and kd_norm in cleaned_norm:
                     return known_dst
+            cleaned_tokens = set(t for t in cleaned_norm.split() if len(t) >= 4)
+            best_dst = ""
+            best_score = 0
+            for known_dst in KNOWN_DESTINATIONS:
+                kd_norm = _norm(known_dst)
+                kd_tokens = set(t for t in kd_norm.split() if len(t) >= 4)
+                if not kd_tokens:
+                    continue
+                overlap = len(cleaned_tokens.intersection(kd_tokens))
+                if overlap > best_score:
+                    best_score = overlap
+                    best_dst = known_dst
+            if best_score >= 1 and len(cleaned_tokens) <= 3:
+                return best_dst
             return cleaned
 
         def _tail_after_qty_kg(text: str, qty_value: str) -> str:
