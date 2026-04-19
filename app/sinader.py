@@ -374,6 +374,77 @@ def _reconstruct_row_blocks_from_lines(lines: List[str]) -> List[str]:
     return blocks
 
 
+def _extract_treatment_from_tail_after_kg_with_source(
+    tail: str,
+    known_treatments: Optional[List[str]] = None,
+) -> Tuple[str, str]:
+    tail_clean = _clean_cell(tail)
+    if not tail_clean:
+        return "", ""
+    tail_norm = _norm(tail_clean)
+    treatment_catalog = list(dict.fromkeys((known_treatments or []) + STRONG_TREATMENT_CATALOG))
+    for term in sorted((t for t in treatment_catalog if _clean_cell(t)), key=lambda x: len(x), reverse=True):
+        term_norm = _norm(term)
+        if not term_norm:
+            continue
+        if re.search(rf"\b{re.escape(term_norm)}\b", tail_norm, flags=re.IGNORECASE):
+            return term, "catalog_tail"
+
+    regex_candidates = [
+        r"pretratamiento\s+de\s+papel,\s*cart[oó]n\s+y\s+productos\s+de\s+papel",
+        r"pretratamiento\s+de\s+pinturas,\s*tintas,\s*adhesivos\s+y\s+resinas\s+que\s+no\s+contienen\s+sustancias\s+peligrosas",
+        r"pretratamiento\s+de\s+detergentes\s+que\s+no\s+contienen\s+sustancias\s+peligrosas",
+        r"reciclaje\s+de\s+residuos\s+de\s+pastas\s+o\s+productos\s+alimenticios\s+para\s+consumo\s+animal",
+        r"reciclaje\s+de\s+residuos\s+hidrobiol[oó]gicos\s+para\s+consumo\s+animal",
+        r"residuos\s+municipales\s+asimilables\s+a\s+domiciliarios",
+        r"reciclaje\s+de\s+papel,\s*cart[oó]n\s+y\s+productos\s+de\s+papel",
+        r"sitio\s+de\s+escombros\s+de\s+la\s+construcci[oó]n",
+        r"recepci[oó]n\s+de\s+lodos\s+en\s+ptas",
+        r"incineraci[oó]n\s+con\s+recuperaci[oó]n\s+de\s+energ[ií]a",
+        r"pretratamiento\s+de\s+aparatos\s+el[eé]ctricos\s+y\s+electr[oó]nicos",
+        r"pretratamiento\s+de\s+aceites\s+y\s+grasas\s+comestibles",
+        r"pretratamiento\s+de\s+madera\s+que\s+no\s+contiene\s+sustancias\s+peligrosas",
+        r"pretratamiento\s+de\s+residuos\s+voluminosos",
+        r"pretratamiento\s+de\s+materiales\s+el[eé]ctricos",
+        r"pretratamiento\s+de\s+neum[aá]ticos\s+fuera\s+de\s+uso",
+        r"pretratamiento\s+de\s+textil,\s*cuero\s+y\s+piel",
+        r"pretratamiento\s+de\s+pl[aá]sticos",
+        r"pretratamiento\s+de\s+metales",
+        r"pretratamiento\s+de\s+caucho\s+y\s+goma",
+        r"pretratamiento\s+de\s+ropa",
+        r"pretratamiento\s+vidrio",
+        r"degradaci[oó]n\s+anaer[oó]bica",
+        r"reciclaje\s+de\s+aparatos\s+el[eé]ctricos\s+y\s+electr[oó]nicos",
+        r"reciclaje\s+de\s+neum[aá]ticos\s+fuera\s+de\s+uso",
+        r"reciclaje\s+de\s+pl[aá]sticos",
+        r"reciclaje\s+de\s+metales",
+        r"reciclaje\s+de\s+textiles",
+        r"reciclaje\s+de\s+vidrio",
+        r"relleno\s+sanitario",
+        r"disposici[oó]n\s+final",
+        r"coincineraci[oó]n",
+        r"aplicaci[oó]n\s+a\s+suelo",
+        r"monorelleno",
+        r"compostaje",
+        r"pretratamiento",
+        r"residuos\s+voluminosos",
+        r"reutilizaci[oó]n",
+        r"combusti[oó]n",
+        r"anaerobic\s+digestion",
+        r"reciclaje",
+    ]
+    for pat in regex_candidates:
+        m = re.search(pat, tail_clean, flags=re.IGNORECASE)
+        if m:
+            return _clean_cell(m.group(0)), "regex_tail"
+    return "", ""
+
+
+def extract_treatment_from_tail_after_kg(tail: str, known_treatments: Optional[List[str]] = None) -> str:
+    treatment, _ = _extract_treatment_from_tail_after_kg_with_source(tail, known_treatments)
+    return treatment
+
+
 def _parse_reconstructed_row_block(
     block: str,
     known_treatments: Optional[List[str]] = None,
@@ -509,16 +580,32 @@ def _parse_reconstructed_row_block(
     desc = _clean_cell(rest[:m_qty.start()])
     qty = _clean_cell(m_qty.group("qty"))
     tail = _clean_cell(rest[m_qty.end():])
-    trt_raw, dst_raw, trp_raw, pat_raw, trt_ok, dst_ok = _parse_tail_right_to_left(tail, desc)
+    treatment_from_tail = extract_treatment_from_tail_after_kg(tail, known_treatments)
+    _, treatment_source = _extract_treatment_from_tail_after_kg_with_source(tail, known_treatments)
+    logger.debug(
+        "SINADER tail post-kg | tail='%s' | treatment='%s' | source='%s'",
+        tail,
+        treatment_from_tail,
+        treatment_source or "none",
+    )
+    tail_remainder = tail
+    if treatment_from_tail:
+        tail_remainder = _clean_cell(re.sub(re.escape(treatment_from_tail), " ", tail_remainder, count=1, flags=re.IGNORECASE))
+    trt_raw, dst_raw, trp_raw, pat_raw, trt_ok, dst_ok = _parse_tail_right_to_left(tail_remainder, desc)
+    if treatment_from_tail:
+        trt_raw = treatment_from_tail
+        trt_ok = True
     trt, dst, trp, pat = _sanitize_treatment_and_logistics(
-        trt_raw or tail,
-        dst_raw,
+        trt_raw or tail_remainder,
+        dst_raw or tail_remainder,
         trp_raw,
         pat_raw,
         qty,
         known_treatments,
         desc,
     )
+    if not treatment_from_tail and trt:
+        treatment_source = "sanitize_fallback"
     treatment_catalog_norm = {_norm(x) for x in (STRONG_TREATMENT_CATALOG + (known_treatments or []))}
     known_destination_norm = {_norm(x) for x in KNOWN_DESTINATIONS}
     trt_ok = bool(trt) and _norm(trt) in treatment_catalog_norm and _is_treatment_clean(trt, desc)
@@ -528,7 +615,7 @@ def _parse_reconstructed_row_block(
     ) and _is_destination_clean(dst, desc)
     qty_ok = _to_float_kg(qty) is not None
     code_ok = bool(code and re.match(r"^\d{2}\s+\d{2}\s+\d{2}$", code))
-    semantic_ok = (trt_ok or dst_ok) and _is_destination_clean(dst, desc) and (not trt or _is_treatment_clean(trt, desc))
+    semantic_ok = (trt_ok or dst_ok) and (not trt or _is_treatment_clean(trt, desc))
     parsing_ok = bool(code_ok and desc and qty_ok and semantic_ok)
     return {
         "Código principal": code,
@@ -542,6 +629,7 @@ def _parse_reconstructed_row_block(
         "Estado contenedor": "",
         "Contenedor": "",
         "Texto fila original": block,
+        "_treatment_source": treatment_source or "none",
         "Parsing_OK": "SI" if parsing_ok else "NO",
         "Tratamiento_confiable": "SI" if trt_ok and bool(trt) else "NO",
         "Destino_confiable": "SI" if dst_ok and bool(dst) else "NO",
