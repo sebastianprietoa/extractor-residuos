@@ -1347,6 +1347,71 @@ def _build_treatment_defra_map_from_dataframe(df: pd.DataFrame) -> Dict[str, str
         mapping[treatment_name] = defra_name
     return mapping
 
+def load_treatment_defra_map(catalog_path: Optional[str] = None) -> Dict[str, str]:
+    configured_path = (catalog_path or os.getenv("SINADER_CATALOG_PATH", "")).strip()
+    candidate_paths = [Path(configured_path)] if configured_path else []
+    candidate_paths.append(DEFAULT_CATALOG_PATH)
+    for path in candidate_paths:
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            excel_file = pd.ExcelFile(path)
+            if TREATMENT_CATALOG_SHEET not in excel_file.sheet_names:
+                continue
+            df = pd.read_excel(path, sheet_name=TREATMENT_CATALOG_SHEET)
+            mapping = _build_treatment_defra_map_from_dataframe(df)
+            if mapping:
+                logger.info("Mapa Tratamiento->DEFRA cargado desde %s (hoja=%s, filas=%s)", path, TREATMENT_CATALOG_SHEET, len(mapping))
+                return mapping
+        except Exception as exc:
+            logger.warning("No se pudo cargar mapa de tratamientos SINADER en %s: %s", path, exc)
+    return dict(DEFAULT_TREATMENT_DEFRA_MAP)
+
+
+def load_treatment_level3_terms(catalog_path: Optional[str] = None) -> List[str]:
+    configured_path = (catalog_path or os.getenv("SINADER_CATALOG_PATH", "")).strip()
+    candidate_paths = [Path(configured_path)] if configured_path else []
+    candidate_paths.append(DEFAULT_CATALOG_PATH)
+    for path in candidate_paths:
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            excel_file = pd.ExcelFile(path)
+            if TREATMENT_CATALOG_SHEET not in excel_file.sheet_names:
+                continue
+            df = pd.read_excel(path, sheet_name=TREATMENT_CATALOG_SHEET)
+            normalized_cols = {_norm(c): c for c in df.columns}
+            level3_col = None
+            for candidate in ["nivel 3", "nivel3", "level 3", "tratamiento", "treatment"]:
+                if candidate in normalized_cols:
+                    level3_col = normalized_cols[candidate]
+                    break
+            if not level3_col:
+                continue
+            values = []
+            for value in df[level3_col].dropna().tolist():
+                text = _clean_cell(value)
+                if text:
+                    values.append(text)
+            unique_values = sorted(set(values), key=lambda x: len(x), reverse=True)
+            if unique_values:
+                logger.info("Tratamientos Nivel 3 cargados desde %s (hoja=%s, filas=%s)", path, TREATMENT_CATALOG_SHEET, len(unique_values))
+                return unique_values
+        except Exception as exc:
+            logger.warning("No se pudo cargar tratamientos Nivel 3 desde %s: %s", path, exc)
+    return []
+
+
+def map_treatment_to_defra(tratamiento: str, treatment_map: Dict[str, str]) -> str:
+    normalized_treatment = _norm(tratamiento)
+    if not normalized_treatment:
+        return ""
+    if normalized_treatment in treatment_map:
+        return treatment_map[normalized_treatment]
+    for key, defra_value in treatment_map.items():
+        if key in normalized_treatment:
+            return defra_value
+    return ""
 
 def load_treatment_defra_map(catalog_path: Optional[str] = None) -> Dict[str, str]:
     configured_path = (catalog_path or os.getenv("SINADER_CATALOG_PATH", "")).strip()
@@ -1662,6 +1727,55 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
         for _, r in df.iterrows()
     ]
     df["DEFRA_base"] = pd.Series(defra_base_values, index=df.index, dtype="object")
+    df["DEFRA"] = df["DEFRA_base"]
+    df["DEFRA_source"] = df["DEFRA_base"].apply(lambda x: "heredada_base" if _clean_cell(x) else "sin_clasificar")
+    if "Tratamiento" in df.columns:
+        def _treatment_is_reliable(row) -> bool:
+            t = _norm(_clean_cell(row.get("Tratamiento", "")))
+            txt = _norm(_clean_cell(row.get("Texto fila original", "")))
+            flag = _norm(_clean_cell(row.get("Tratamiento_confiable", "no")))
+            if flag not in {"si", "yes", "true"}:
+                return False
+            if not t:
+                return False
+            bad_tokens = ["cantidad residuo", "tipo tratamiento destino", "transportista patente", "destino transportista"]
+            if any(b in t for b in bad_tokens):
+                return False
+            if any(b in txt for b in bad_tokens):
+                return False
+            return True
+
+        def _resolve_defra(row: pd.Series) -> Tuple[str, str]:
+            base_value = _clean_cell(row.get("DEFRA_base", ""))
+            treatment_value = _clean_cell(row.get("Tratamiento", ""))
+            code_value = _clean_cell(row.get("Código principal", ""))
+            desc_value = _clean_cell(row.get("Descripción Residuo", ""))
+            destination_value = _clean_cell(row.get("Destino", ""))
+            if _treatment_is_reliable(row):
+                mapped = _clean_cell(map_treatment_to_defra(treatment_value, treatment_defra_map))
+                if mapped:
+                    return mapped, "ajustada_tratamiento"
+            contextual = _clean_cell(defra_classification(
+                desc_residuo=desc_value,
+                sin_movimientos=row.get("Sin movimientos", ""),
+                codigo_principal=code_value,
+                tratamiento=treatment_value if _treatment_is_reliable(row) else "",
+                destino=destination_value,
+            ))
+            if contextual:
+                if contextual == base_value:
+                    return contextual, "heredada_base"
+                return contextual, "ajustada_regla_codigo"
+            if base_value:
+                return base_value, "heredada_base"
+            return "", "sin_clasificar"
+
+        resolved = df.apply(_resolve_defra, axis=1)
+        df["DEFRA"] = resolved.apply(lambda x: x[0])
+        df["DEFRA_source"] = resolved.apply(lambda x: x[1])
+    df["DEFRA_confiable"] = df["DEFRA_source"].apply(
+        lambda x: "SI" if _clean_cell(x) in {"heredada_base", "ajustada_tratamiento", "ajustada_regla_codigo"} else "NO"
+    )
     df["DEFRA"] = df["DEFRA_base"]
     df["DEFRA_source"] = df["DEFRA_base"].apply(lambda x: "heredada_base" if _clean_cell(x) else "sin_clasificar")
     if "Tratamiento" in df.columns:
