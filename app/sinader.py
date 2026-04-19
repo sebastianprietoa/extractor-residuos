@@ -19,10 +19,6 @@ _cv2_spec = importlib.util.find_spec("cv2")
 cv2 = importlib.import_module("cv2") if _cv2_spec else None
 _np_spec = importlib.util.find_spec("numpy")
 np = importlib.import_module("numpy") if _np_spec else None
-_pil_image_spec = importlib.util.find_spec("PIL.Image")
-PIL_Image = importlib.import_module("PIL.Image") if _pil_image_spec else None
-_pil_draw_spec = importlib.util.find_spec("PIL.ImageDraw")
-PIL_ImageDraw = importlib.import_module("PIL.ImageDraw") if _pil_draw_spec else None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -574,57 +570,26 @@ def parse_sinader_rows_from_text(full_text: str) -> List[Dict[str, str]]:
     return list(uniq.values())
 
 
-def render_pdf_page_to_image(doc, page_index: int, dpi: int = 220, pdfplumber_page=None):
-    if np is None:
+def render_pdf_page_to_image(doc, page_index: int, dpi: int = 220):
+    if fitz is None or np is None:
         return None
-    if fitz is not None and doc is not None:
-        zoom = dpi / 72.0
-        page = doc.load_page(page_index)
-        matrix = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=matrix, alpha=False)
-        buffer = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.height, pix.width, pix.n))
-        if pix.n == 3:
-            img_bgr = buffer[:, :, ::-1].copy()
-        else:
-            img_bgr = cv2.cvtColor(buffer, cv2.COLOR_RGBA2BGR) if cv2 is not None else buffer[:, :, :3].copy()
-        scale_x = pix.width / float(page.rect.width)
-        scale_y = pix.height / float(page.rect.height)
-        return img_bgr, page.rect.width, page.rect.height, scale_x, scale_y
-    if pdfplumber_page is not None:
-        page_im = pdfplumber_page.to_image(resolution=dpi).original
-        arr = np.array(page_im)
-        if arr.ndim == 2:
-            arr = np.stack([arr, arr, arr], axis=-1)
-        if arr.shape[-1] == 4:
-            arr = arr[:, :, :3]
-        img_bgr = arr[:, :, ::-1].copy()
-        scale_x = img_bgr.shape[1] / float(pdfplumber_page.width)
-        scale_y = img_bgr.shape[0] / float(pdfplumber_page.height)
-        return img_bgr, pdfplumber_page.width, pdfplumber_page.height, scale_x, scale_y
-    return None
+    zoom = dpi / 72.0
+    page = doc.load_page(page_index)
+    matrix = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=matrix, alpha=False)
+    buffer = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.height, pix.width, pix.n))
+    if pix.n == 3:
+        img_bgr = buffer[:, :, ::-1].copy()
+    else:
+        img_bgr = cv2.cvtColor(buffer, cv2.COLOR_RGBA2BGR) if cv2 is not None else buffer[:, :, :3].copy()
+    scale_x = pix.width / float(page.rect.width)
+    scale_y = pix.height / float(page.rect.height)
+    return img_bgr, page.rect.width, page.rect.height, scale_x, scale_y
 
 
 def detect_table_bbox_from_image(img_bgr):
-    if np is None or img_bgr is None:
+    if cv2 is None or np is None or img_bgr is None:
         return None
-    if cv2 is None:
-        rgb = img_bgr[:, :, ::-1]
-        gray = (0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]).astype("uint8")
-        ink = gray < 220
-        row_density = np.sum(ink, axis=1)
-        active_rows = np.where(row_density > np.percentile(row_density, 70))[0]
-        if active_rows.size == 0:
-            return None
-        y0 = max(0, int(active_rows.min()) - 10)
-        y1 = min(gray.shape[0] - 1, int(active_rows.max()) + 10)
-        sub = ink[y0:y1 + 1, :]
-        col_density = np.sum(sub, axis=0)
-        active_cols = np.where(col_density > np.percentile(col_density, 60))[0]
-        if active_cols.size == 0:
-            return (0, y0, gray.shape[1] - 1, y1)
-        x0 = max(0, int(active_cols.min()) - 8)
-        x1 = min(gray.shape[1] - 1, int(active_cols.max()) + 8)
-        return (x0, y0, x1, y1)
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (3, 3), 0)
     th = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 15)
@@ -658,43 +623,12 @@ def detect_table_bbox_from_image(img_bgr):
 
 
 def segment_row_bboxes_from_image(img_bgr, table_bbox):
-    if np is None or img_bgr is None or table_bbox is None:
+    if cv2 is None or np is None or img_bgr is None or table_bbox is None:
         return []
     x0, y0, x1, y1 = table_bbox
     roi = img_bgr[y0:y1, x0:x1]
     if roi.size == 0:
         return []
-    if cv2 is None:
-        rgb = roi[:, :, ::-1]
-        gray = (0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]).astype("uint8")
-        ink = gray < 220
-        row_proj = np.sum(ink, axis=1)
-        threshold = max(3, int((x1 - x0) * 0.01))
-        active = row_proj > threshold
-        spans: List[Tuple[int, int]] = []
-        start = None
-        for i, on in enumerate(active):
-            if on and start is None:
-                start = i
-            elif not on and start is not None:
-                spans.append((start, i - 1))
-                start = None
-        if start is not None:
-            spans.append((start, len(active) - 1))
-        merged: List[Tuple[int, int]] = []
-        for s, e in spans:
-            if not merged:
-                merged.append((s, e))
-            elif s - merged[-1][1] <= 12:
-                merged[-1] = (merged[-1][0], e)
-            else:
-                merged.append((s, e))
-        out = []
-        for s, e in merged:
-            if e - s + 1 < 12:
-                continue
-            out.append((x0, y0 + max(0, s - 3), x1, y0 + min((y1 - y0) - 1, e + 3)))
-        return out
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 31, 11)
     # une caracteres por línea
@@ -733,35 +667,26 @@ def segment_row_bboxes_from_image(img_bgr, table_bbox):
     return row_boxes
 
 
-def extract_pdf_text_from_bbox(page, bbox_img, scale_x: float, scale_y: float, page_is_pdfplumber: bool = False) -> str:
+def extract_pdf_text_from_bbox(page, bbox_img, scale_x: float, scale_y: float) -> str:
     x0i, y0i, x1i, y1i = bbox_img
     x0 = max(0.0, x0i / scale_x)
     y0 = max(0.0, y0i / scale_y)
     x1 = min(page.rect.width, x1i / scale_x)
     y1 = min(page.rect.height, y1i / scale_y)
-    if page_is_pdfplumber:
-        text = page.within_bbox((x0, y0, x1, y1)).extract_text() or ""
-    else:
-        rect = fitz.Rect(x0, y0, x1, y1)
-        text = page.get_text("text", clip=rect) if fitz is not None else ""
+    rect = fitz.Rect(x0, y0, x1, y1)
+    text = page.get_text("text", clip=rect) if fitz is not None else ""
     return _clean_cell(text)
 
 
 def ocr_text_from_bbox(img_bgr, bbox_img) -> str:
-    if pytesseract is None or img_bgr is None or np is None:
+    if pytesseract is None or cv2 is None or img_bgr is None:
         return ""
     x0, y0, x1, y1 = bbox_img
     crop = img_bgr[max(0, y0):max(0, y1), max(0, x0):max(0, x1)]
     if crop.size == 0:
         return ""
-    if cv2 is not None:
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        txt = pytesseract.image_to_string(gray, lang="spa+eng")
-    elif PIL_Image is not None:
-        rgb = crop[:, :, ::-1]
-        txt = pytesseract.image_to_string(PIL_Image.fromarray(rgb), lang="spa+eng")
-    else:
-        txt = ""
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    txt = pytesseract.image_to_string(gray, lang="spa+eng")
     return _clean_cell(txt)
 
 
@@ -771,47 +696,18 @@ def _row_text_is_incoherent(text: str) -> bool:
         return True
     has_code = bool(re.search(r"\b\d{2}\s+\d{2}\s+\d{2}\b", t))
     has_kg = bool(re.search(r"\d[\d\.,]*\s*kg\b", t, flags=re.IGNORECASE))
-    has_keywords = any(k in _norm(t) for k in ["reciclaje", "relleno", "compostaje", "destino", "planta", "escombrera", "ecofibras"])
-    return (not (has_code and has_kg)) or (len(t) < 45 and not has_keywords)
-
-
-def _save_visual_debug_page(debug_dir: Path, page_index: int, img_bgr, table_bbox, row_boxes, row_texts: List[Dict[str, str]]) -> None:
-    if PIL_Image is None or np is None:
-        return
-    rgb = img_bgr[:, :, ::-1]
-    img = PIL_Image.fromarray(rgb)
-    if PIL_ImageDraw is not None:
-        draw = PIL_ImageDraw.Draw(img)
-        if table_bbox:
-            draw.rectangle(table_bbox, outline="red", width=3)
-        for i, b in enumerate(row_boxes):
-            draw.rectangle(b, outline="lime", width=2)
-            draw.text((b[0] + 2, b[1] + 2), str(i + 1), fill="yellow")
-    img.save(debug_dir / f"page_{page_index+1:02d}_bboxes.png")
-    txt_path = debug_dir / f"page_{page_index+1:02d}_rows.txt"
-    with txt_path.open("w", encoding="utf-8") as f:
-        for idx, row in enumerate(row_texts, start=1):
-            f.write(f"[ROW {idx}] native={row.get('native','')} | ocr={row.get('ocr','')} | used={row.get('used','')}\n")
+    return not (has_code and has_kg)
 
 
 def parse_sinader_rows_visual_segmented(pdf_path: str) -> List[Dict[str, str]]:
     rows_out: List[Dict[str, str]] = []
     known_treatments = load_treatment_level3_terms()
-    if np is None:
+    if fitz is None or cv2 is None or np is None:
         return rows_out
-    debug_dir_env = os.getenv("SINADER_VISUAL_DEBUG_DIR", "").strip()
-    debug_target_name = os.getenv("SINADER_VISUAL_DEBUG_PDF", "").strip().lower()
-    debug_enabled = bool(debug_dir_env) and (not debug_target_name or debug_target_name in Path(pdf_path).name.lower())
-    debug_dir = Path(debug_dir_env) / Path(pdf_path).stem if debug_enabled else None
-    if debug_dir:
-        debug_dir.mkdir(parents=True, exist_ok=True)
-    doc = fitz.open(pdf_path) if fitz is not None else None
-    plumber_pdf = pdfplumber.open(pdf_path)
+    doc = fitz.open(pdf_path)
     try:
-        page_count = doc.page_count if doc is not None else len(plumber_pdf.pages)
-        for page_index in range(page_count):
-            plumber_page = plumber_pdf.pages[page_index]
-            rendered = render_pdf_page_to_image(doc, page_index, dpi=220, pdfplumber_page=plumber_page)
+        for page_index in range(doc.page_count):
+            rendered = render_pdf_page_to_image(doc, page_index, dpi=220)
             if not rendered:
                 continue
             img_bgr, _, _, scale_x, scale_y = rendered
@@ -819,29 +715,20 @@ def parse_sinader_rows_visual_segmented(pdf_path: str) -> List[Dict[str, str]]:
             if not table_bbox:
                 continue
             row_boxes = segment_row_bboxes_from_image(img_bgr, table_bbox)
-            if not row_boxes:
-                continue
-            page = doc.load_page(page_index) if doc is not None else plumber_page
-            row_debug_texts: List[Dict[str, str]] = []
+            page = doc.load_page(page_index)
             for bbox_img in row_boxes:
-                text_native = extract_pdf_text_from_bbox(page, bbox_img, scale_x, scale_y, page_is_pdfplumber=(doc is None))
+                text_native = extract_pdf_text_from_bbox(page, bbox_img, scale_x, scale_y)
                 text_used = text_native
-                text_ocr = ""
                 if _row_text_is_incoherent(text_native):
                     text_ocr = ocr_text_from_bbox(img_bgr, bbox_img)
                     if text_ocr and (not text_native or len(text_ocr) > len(text_native) * 0.7):
                         text_used = text_ocr
-                row_debug_texts.append({"native": text_native, "ocr": text_ocr, "used": text_used})
                 parsed = _parse_reconstructed_row_block(text_used, known_treatments)
                 if parsed:
                     parsed["Texto fila original"] = text_used
                     rows_out.append(parsed)
-            if debug_dir is not None:
-                _save_visual_debug_page(debug_dir, page_index, img_bgr, table_bbox, row_boxes, row_debug_texts)
     finally:
-        if doc is not None:
-            doc.close()
-        plumber_pdf.close()
+        doc.close()
     uniq = {}
     for r in rows_out:
         key = (r.get("Código principal", ""), _norm(r.get("Descripción Residuo", "")), _clean_cell(r.get("Cantidad (Kg)", "")))
@@ -1347,71 +1234,6 @@ def _build_treatment_defra_map_from_dataframe(df: pd.DataFrame) -> Dict[str, str
         mapping[treatment_name] = defra_name
     return mapping
 
-def load_treatment_defra_map(catalog_path: Optional[str] = None) -> Dict[str, str]:
-    configured_path = (catalog_path or os.getenv("SINADER_CATALOG_PATH", "")).strip()
-    candidate_paths = [Path(configured_path)] if configured_path else []
-    candidate_paths.append(DEFAULT_CATALOG_PATH)
-    for path in candidate_paths:
-        if not path.exists() or not path.is_file():
-            continue
-        try:
-            excel_file = pd.ExcelFile(path)
-            if TREATMENT_CATALOG_SHEET not in excel_file.sheet_names:
-                continue
-            df = pd.read_excel(path, sheet_name=TREATMENT_CATALOG_SHEET)
-            mapping = _build_treatment_defra_map_from_dataframe(df)
-            if mapping:
-                logger.info("Mapa Tratamiento->DEFRA cargado desde %s (hoja=%s, filas=%s)", path, TREATMENT_CATALOG_SHEET, len(mapping))
-                return mapping
-        except Exception as exc:
-            logger.warning("No se pudo cargar mapa de tratamientos SINADER en %s: %s", path, exc)
-    return dict(DEFAULT_TREATMENT_DEFRA_MAP)
-
-
-def load_treatment_level3_terms(catalog_path: Optional[str] = None) -> List[str]:
-    configured_path = (catalog_path or os.getenv("SINADER_CATALOG_PATH", "")).strip()
-    candidate_paths = [Path(configured_path)] if configured_path else []
-    candidate_paths.append(DEFAULT_CATALOG_PATH)
-    for path in candidate_paths:
-        if not path.exists() or not path.is_file():
-            continue
-        try:
-            excel_file = pd.ExcelFile(path)
-            if TREATMENT_CATALOG_SHEET not in excel_file.sheet_names:
-                continue
-            df = pd.read_excel(path, sheet_name=TREATMENT_CATALOG_SHEET)
-            normalized_cols = {_norm(c): c for c in df.columns}
-            level3_col = None
-            for candidate in ["nivel 3", "nivel3", "level 3", "tratamiento", "treatment"]:
-                if candidate in normalized_cols:
-                    level3_col = normalized_cols[candidate]
-                    break
-            if not level3_col:
-                continue
-            values = []
-            for value in df[level3_col].dropna().tolist():
-                text = _clean_cell(value)
-                if text:
-                    values.append(text)
-            unique_values = sorted(set(values), key=lambda x: len(x), reverse=True)
-            if unique_values:
-                logger.info("Tratamientos Nivel 3 cargados desde %s (hoja=%s, filas=%s)", path, TREATMENT_CATALOG_SHEET, len(unique_values))
-                return unique_values
-        except Exception as exc:
-            logger.warning("No se pudo cargar tratamientos Nivel 3 desde %s: %s", path, exc)
-    return []
-
-
-def map_treatment_to_defra(tratamiento: str, treatment_map: Dict[str, str]) -> str:
-    normalized_treatment = _norm(tratamiento)
-    if not normalized_treatment:
-        return ""
-    if normalized_treatment in treatment_map:
-        return treatment_map[normalized_treatment]
-    for key, defra_value in treatment_map.items():
-        if key in normalized_treatment:
-            return defra_value
-    return ""
 
 def load_treatment_defra_map(catalog_path: Optional[str] = None) -> Dict[str, str]:
     configured_path = (catalog_path or os.getenv("SINADER_CATALOG_PATH", "")).strip()
@@ -1479,6 +1301,59 @@ def map_treatment_to_defra(tratamiento: str, treatment_map: Dict[str, str]) -> s
             return defra_value
     return ""
 
+def choose_canonical_treatment(extracted_treatment: str, known_treatments: List[str], threshold: float = 0.58) -> str:
+    raw = _clean_cell(extracted_treatment)
+    if not raw or not known_treatments:
+        return raw
+    a = _normalize_for_match(raw)
+    if not a:
+        return raw
+    best_term = raw
+    best_score = 0.0
+    for term in known_treatments:
+        b = _normalize_for_match(term)
+        if not b:
+            continue
+        score = 1.0 if (a in b or b in a) else SequenceMatcher(None, a, b).ratio()
+        if score > best_score:
+            best_score = score
+            best_term = term
+    return best_term if best_score >= threshold else raw
+
+
+def load_treatment_alias_map(training_files: Optional[List[str]] = None) -> Dict[str, str]:
+    files = training_files or sorted(glob.glob(DEFAULT_TREATMENT_TRAINING_GLOB))
+    alias_map: Dict[str, str] = {}
+    for file_path in files:
+        try:
+            df = pd.read_excel(file_path)
+        except Exception:
+            continue
+        if df.empty:
+            continue
+        normalized_cols = {_norm(c): c for c in df.columns}
+        extracted_col = None
+        expected_col = None
+        extracted_candidates = ["tratamiento", "tratamiento actual", "tratamiento extraido", "tratamiento extraído"]
+        expected_candidates = ["tratamiento esperado", "esperado tratamiento", "tratamiento objetivo", "tratamiento correcto"]
+        for c in extracted_candidates:
+            if c in normalized_cols:
+                extracted_col = normalized_cols[c]
+                break
+        for c in expected_candidates:
+            if c in normalized_cols:
+                expected_col = normalized_cols[c]
+                break
+        if not extracted_col or not expected_col:
+            continue
+        for _, row in df[[extracted_col, expected_col]].dropna(how="any").iterrows():
+            src = _norm(_clean_cell(row[extracted_col]))
+            dst = _clean_cell(row[expected_col])
+            if src and dst:
+                alias_map[src] = dst
+    if alias_map:
+        logger.info("Mapa de alias de tratamiento cargado desde salidas históricas (%s reglas)", len(alias_map))
+    return alias_map
 
 def choose_canonical_treatment(extracted_treatment: str, known_treatments: List[str], threshold: float = 0.58) -> str:
     raw = _clean_cell(extracted_treatment)
@@ -1716,65 +1591,15 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
         df["DEFRA_source"] = ""
     if "DEFRA_confiable" not in df.columns:
         df["DEFRA_confiable"] = "NO"
-    defra_base_values = [
-        defra_classification(
+    df["DEFRA_base"] = df.apply(
+        lambda r: defra_classification(
             desc_residuo=r.get("Descripción Residuo", ""),
             sin_movimientos=r.get("Sin movimientos", ""),
             codigo_principal=r.get("Código principal", ""),
             tratamiento="",
             destino="",
-        )
-        for _, r in df.iterrows()
-    ]
-    df["DEFRA_base"] = pd.Series(defra_base_values, index=df.index, dtype="object")
-    df["DEFRA"] = df["DEFRA_base"]
-    df["DEFRA_source"] = df["DEFRA_base"].apply(lambda x: "heredada_base" if _clean_cell(x) else "sin_clasificar")
-    if "Tratamiento" in df.columns:
-        def _treatment_is_reliable(row) -> bool:
-            t = _norm(_clean_cell(row.get("Tratamiento", "")))
-            txt = _norm(_clean_cell(row.get("Texto fila original", "")))
-            flag = _norm(_clean_cell(row.get("Tratamiento_confiable", "no")))
-            if flag not in {"si", "yes", "true"}:
-                return False
-            if not t:
-                return False
-            bad_tokens = ["cantidad residuo", "tipo tratamiento destino", "transportista patente", "destino transportista"]
-            if any(b in t for b in bad_tokens):
-                return False
-            if any(b in txt for b in bad_tokens):
-                return False
-            return True
-
-        def _resolve_defra(row: pd.Series) -> Tuple[str, str]:
-            base_value = _clean_cell(row.get("DEFRA_base", ""))
-            treatment_value = _clean_cell(row.get("Tratamiento", ""))
-            code_value = _clean_cell(row.get("Código principal", ""))
-            desc_value = _clean_cell(row.get("Descripción Residuo", ""))
-            destination_value = _clean_cell(row.get("Destino", ""))
-            if _treatment_is_reliable(row):
-                mapped = _clean_cell(map_treatment_to_defra(treatment_value, treatment_defra_map))
-                if mapped:
-                    return mapped, "ajustada_tratamiento"
-            contextual = _clean_cell(defra_classification(
-                desc_residuo=desc_value,
-                sin_movimientos=row.get("Sin movimientos", ""),
-                codigo_principal=code_value,
-                tratamiento=treatment_value if _treatment_is_reliable(row) else "",
-                destino=destination_value,
-            ))
-            if contextual:
-                if contextual == base_value:
-                    return contextual, "heredada_base"
-                return contextual, "ajustada_regla_codigo"
-            if base_value:
-                return base_value, "heredada_base"
-            return "", "sin_clasificar"
-
-        resolved = df.apply(_resolve_defra, axis=1)
-        df["DEFRA"] = resolved.apply(lambda x: x[0])
-        df["DEFRA_source"] = resolved.apply(lambda x: x[1])
-    df["DEFRA_confiable"] = df["DEFRA_source"].apply(
-        lambda x: "SI" if _clean_cell(x) in {"heredada_base", "ajustada_tratamiento", "ajustada_regla_codigo"} else "NO"
+        ),
+        axis=1,
     )
     df["DEFRA"] = df["DEFRA_base"]
     df["DEFRA_source"] = df["DEFRA_base"].apply(lambda x: "heredada_base" if _clean_cell(x) else "sin_clasificar")
