@@ -651,8 +651,14 @@ def _sanitize_treatment_and_logistics(
                 kd_norm = _norm(known_dst)
                 if kd_norm and kd_norm in original_norm:
                     return known_dst
+            if "estacion de transferencia" in original_norm or "estación de transferencia" in original_norm:
+                return "ESTACIÓN DE TRANSFERENCIA"
             if "collipulli" in original_norm:
                 return "CONSORCIO COLLIPULLI"
+            if "lautaro" in original_norm:
+                return "PLANTA DE TRATAMIENTO DE RESIDUOS DOMICILIARIOS LAUTARO"
+            if "ecobio" in original_norm:
+                return "ECOBIO"
             for frag in DESTINATION_NOISE_FRAGMENTS:
                 cleaned = re.sub(re.escape(frag), " ", cleaned, flags=re.IGNORECASE)
             cleaned = re.sub(r"\bespecificad[ao]s?\b", " ", cleaned, flags=re.IGNORECASE)
@@ -668,19 +674,23 @@ def _sanitize_treatment_and_logistics(
                 kd_norm = _norm(known_dst)
                 if kd_norm and kd_norm in cleaned_norm:
                     return known_dst
-            cleaned_tokens = set(t for t in cleaned_norm.split() if len(t) >= 4)
+            generic_dst_tokens = {
+                "planta", "tratamiento", "residuos", "domiciliarios", "relleno", "sanitario", "sucursal",
+                "centro", "cancha", "compostaje", "puerto", "sur", "isla", "los", "las", "del", "de",
+            }
+            cleaned_tokens = set(t for t in cleaned_norm.split() if len(t) >= 4 and t not in generic_dst_tokens)
             best_dst = ""
             best_score = 0
             for known_dst in KNOWN_DESTINATIONS:
                 kd_norm = _norm(known_dst)
-                kd_tokens = set(t for t in kd_norm.split() if len(t) >= 4)
+                kd_tokens = set(t for t in kd_norm.split() if len(t) >= 4 and t not in generic_dst_tokens)
                 if not kd_tokens:
                     continue
                 overlap = len(cleaned_tokens.intersection(kd_tokens))
                 if overlap > best_score:
                     best_score = overlap
                     best_dst = known_dst
-            if best_score >= 1 and len(cleaned_tokens) <= 3:
+            if best_score >= 2 and len(cleaned_tokens) <= 4:
                 return best_dst
             return cleaned
 
@@ -881,11 +891,9 @@ def choose_canonical_description(extracted_desc: str, codigo: str, catalog: Dict
         scored = sorted([(cand, _prefix_similarity(extracted_desc, cand)) for cand in same_code_candidates], key=lambda x: x[1], reverse=True)
         if scored[0][1] >= threshold:
             return scored[0][0]
-    all_candidates = [d for descs in catalog.values() for d in descs]
-    if not all_candidates:
-        return extracted_desc
-    scored = sorted([(cand, _prefix_similarity(extracted_desc, cand)) for cand in all_candidates], key=lambda x: x[1], reverse=True)
-    return scored[0][0] if scored[0][1] >= threshold else extracted_desc
+    # Blindaje: si no hay candidatos para el mismo código, no forzar reemplazo por similitud global.
+    # Esto evita contaminaciones como 15 01 06 -> "Envases metálicos" por fuzzy matching agresivo.
+    return extracted_desc
 
 
 def _build_catalog_from_dataframe(df: pd.DataFrame) -> Dict[str, List[str]]:
