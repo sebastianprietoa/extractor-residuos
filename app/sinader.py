@@ -1769,10 +1769,11 @@ def defra_classification(desc_residuo: str, sin_movimientos: str = "", codigo_pr
 def extract_any_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[str, str], str]:
     with pdfplumber.open(pdf_path) as pdf:
         full_text = "\n".join([(p.extract_text() or "") for p in pdf.pages])
-    if is_sinader_pdf(full_text):
-        rows, meta = extract_sinader_from_pdf(pdf_path)
-        return rows, meta, "SINADER"
-    return [], {"FuentePDF": Path(pdf_path).name}, "UNKNOWN"
+    # En este módulo se procesan certificados SINADER; siempre intentamos el parser SINADER
+    # incluso si el texto nativo viene pobre (PDF escaneado / extracción textual limitada).
+    rows, meta = extract_sinader_from_pdf(pdf_path)
+    kind = "SINADER" if rows or is_sinader_pdf(full_text) else "UNKNOWN"
+    return rows, meta, kind
 
 
 def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
@@ -1784,6 +1785,25 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
         try:
             rows, meta, kind = extract_any_pdf(p)
             logger.info("Procesado: %s | tipo=%s | filas_detalle=%s", Path(p).name, kind, len(rows))
+            if kind == "SINADER" and not rows:
+                rows = [{
+                    "N.": "0",
+                    "Descripción Residuo": "SIN FILAS DETECTADAS",
+                    "Código principal": "",
+                    "Peligrosidad": "",
+                    "Cantidad (Kg)": "",
+                    "Estado contenedor": "",
+                    "Contenedor": "",
+                    "Tratamiento": "",
+                    "Destino": "",
+                    "Transportista": "",
+                    "Patente": "",
+                    "Sin movimientos": "NO",
+                    "Texto fila original": "",
+                    "Parsing_OK": "NO",
+                    "Tratamiento_confiable": "NO",
+                    "Destino_confiable": "NO",
+                }]
             for r in rows:
                 merged = dict(meta)
                 merged.update(r)
