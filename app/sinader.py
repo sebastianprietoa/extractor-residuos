@@ -1873,6 +1873,55 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
     df["DEFRA_confiable"] = df["DEFRA_source"].apply(
         lambda x: "SI" if _clean_cell(x) in {"heredada_base", "ajustada_tratamiento", "ajustada_regla_codigo"} else "NO"
     )
+    df["DEFRA"] = df["DEFRA_base"]
+    df["DEFRA_source"] = df["DEFRA_base"].apply(lambda x: "heredada_base" if _clean_cell(x) else "sin_clasificar")
+    if "Tratamiento" in df.columns:
+        def _treatment_is_reliable(row) -> bool:
+            t = _norm(_clean_cell(row.get("Tratamiento", "")))
+            txt = _norm(_clean_cell(row.get("Texto fila original", "")))
+            flag = _norm(_clean_cell(row.get("Tratamiento_confiable", "no")))
+            if flag not in {"si", "yes", "true"}:
+                return False
+            if not t:
+                return False
+            bad_tokens = ["cantidad residuo", "tipo tratamiento destino", "transportista patente", "destino transportista"]
+            if any(b in t for b in bad_tokens):
+                return False
+            if any(b in txt for b in bad_tokens):
+                return False
+            return True
+
+        def _resolve_defra(row: pd.Series) -> Tuple[str, str]:
+            base_value = _clean_cell(row.get("DEFRA_base", ""))
+            treatment_value = _clean_cell(row.get("Tratamiento", ""))
+            code_value = _clean_cell(row.get("Código principal", ""))
+            desc_value = _clean_cell(row.get("Descripción Residuo", ""))
+            destination_value = _clean_cell(row.get("Destino", ""))
+            if _treatment_is_reliable(row):
+                mapped = _clean_cell(map_treatment_to_defra(treatment_value, treatment_defra_map))
+                if mapped:
+                    return mapped, "ajustada_tratamiento"
+            contextual = _clean_cell(defra_classification(
+                desc_residuo=desc_value,
+                sin_movimientos=row.get("Sin movimientos", ""),
+                codigo_principal=code_value,
+                tratamiento=treatment_value if _treatment_is_reliable(row) else "",
+                destino=destination_value,
+            ))
+            if contextual:
+                if contextual == base_value:
+                    return contextual, "heredada_base"
+                return contextual, "ajustada_regla_codigo"
+            if base_value:
+                return base_value, "heredada_base"
+            return "", "sin_clasificar"
+
+        resolved = df.apply(_resolve_defra, axis=1)
+        df["DEFRA"] = resolved.apply(lambda x: x[0])
+        df["DEFRA_source"] = resolved.apply(lambda x: x[1])
+    df["DEFRA_confiable"] = df["DEFRA_source"].apply(
+        lambda x: "SI" if _clean_cell(x) in {"heredada_base", "ajustada_tratamiento", "ajustada_regla_codigo"} else "NO"
+    )
     Path(output_excel).parent.mkdir(parents=True, exist_ok=True)
     df.to_excel(output_excel, index=False)
     logger.info("Excel generado: %s | filas=%s", output_excel, len(df))
