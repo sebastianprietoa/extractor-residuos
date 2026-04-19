@@ -62,6 +62,14 @@ KNOWN_DESTINATIONS = [
     "PLANTA DE TRATAMIENTO DE AGUAS SERVIDAS DE CASTRO",
     "RELLENO SANITARIO LOS ANGELES",
     "PLANTA DE TRATAMIENTO DE RESIDUOS DOMICILIARIOS LAUTARO",
+    "SALMONOIL S.A.",
+    "LOS GLACIARES",
+    "PESQUERA LANDES ISLA ROCUANT",
+    "PESQUERA LA PORTADA",
+    "REPLACAR",
+    "PLANTA RILESUR",
+    "ESTACIÓN DE TRANSFERENCIA",
+    "ESTACION DE TRANSFERENCIA",
 ]
 DESTINATION_NOISE_FRAGMENTS = [
     "en otra categoría",
@@ -82,7 +90,14 @@ STRONG_TREATMENT_CATALOG = [
     "Recepción de Lodos en PTAS",
     "Sitio de Escombros de la Construcción",
     "Pretratamiento",
+    "Pretratamiento de plásticos",
+    "Reciclaje de residuos hidrobiológicos para consumo animal",
+    "Residuos municipales asimilables a domiciliarios",
 ]
+KNOWN_SINADER_CODES = {
+    "15 01 01", "15 01 02", "15 01 04", "20 01 99", "19 08 05", "10 01 01", "21 04 04", "02 02 04",
+    "02 01 99", "02 01 02", "02 02 02", "02 02 03", "20 01 39", "15 01 06", "21 07 09", "21 07 01",
+}
 
 
 def _strip_accents(s: str) -> str:
