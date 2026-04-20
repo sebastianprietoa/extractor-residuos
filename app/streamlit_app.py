@@ -76,7 +76,14 @@ def _render_header() -> None:
         """
         <style>
             .stApp { background: """ + LIGHT_BG + """; }
-            .main-title { font-size: 3.4rem; font-weight: 800; margin-bottom: 0; color: """ + DARK + """; }
+            .main-title {
+                font-size: 6.8rem;
+                line-height: 1.02;
+                font-weight: 800;
+                margin-bottom: 0;
+                color: """ + DARK + """;
+                text-align: left;
+            }
             .subtitle { color: #496153; margin-top: 0.15rem; font-size: 1.05rem; }
             .box {
                 border: 1px solid #d2e9d9;
@@ -146,14 +153,12 @@ def _render_header() -> None:
         unsafe_allow_html=True,
     )
 
-    _, center, _ = st.columns([1, 3, 1])
-    with center:
-        st.markdown("<span class='pill'>Gestión sustentable</span>", unsafe_allow_html=True)
-        st.markdown("<p class='main-title'>Hub Inteligente de Certificados</p>", unsafe_allow_html=True)
-        st.markdown(
-            "<p class='subtitle'>Centraliza SINADER, SINDREP y Autocontrol en un solo flujo.</p>",
-            unsafe_allow_html=True,
-        )
+    st.markdown("<span class='pill'>Gestión sustentable</span>", unsafe_allow_html=True)
+    st.markdown("<p class='main-title'>Hub Inteligente de Certificados</p>", unsafe_allow_html=True)
+    st.markdown(
+        "<p class='subtitle'>Centraliza SINADER, SIDREP y Autocontrol en un solo flujo.</p>",
+        unsafe_allow_html=True,
+    )
 
 
 def _save_uploads(uploaded_files: Iterable[object], input_dir: Path) -> int:
@@ -189,11 +194,18 @@ def _render_preview_from_excel(path: Path, title: str) -> None:
         st.warning(f"No se pudo generar previsualización de {title}: {exc}")
         return
     st.markdown(f"#### 👀 Previsualización — {title}")
-    preferred = [c for c in [
-        "FuentePDF", "N.", "Descripción Residuo", "Código principal", "Cantidad (Kg)",
-        "Tratamiento", "Destino", "Transportista", "Patente",
-        "DEFRA_English", "DEFRA_Español", "Clasificación DEFRA", "DEFRA",
-    ] if c in df.columns]
+    if title.upper() == "SINADER":
+        preferred = [c for c in [
+            "FuentePDF", "Código principal", "Residuo oficial", "residuo", "Descripción Residuo",
+            "Cantidad (Kg)", "Tratamiento",
+            "DEFRA_Residuo", "DEFRA_Residuo_ES", "DEFRA",
+        ] if c in df.columns]
+    else:
+        preferred = [c for c in [
+            "FuentePDF", "N.", "Descripción Residuo", "Código principal", "Cantidad (Kg)",
+            "Tratamiento", "Destino", "Transportista", "Patente",
+            "DEFRA_English", "DEFRA_Español", "Clasificación DEFRA", "DEFRA",
+        ] if c in df.columns]
     view = df[preferred] if preferred else df
     st.dataframe(view.head(20), use_container_width=True)
 
@@ -222,9 +234,9 @@ def main() -> None:
         st.header("⚙️ Configuración")
         source_labels = {
             "SINADER": "♻️ Certificado SINADER",
-            "SINDREP": "🏭 Certificado SINDREP",
+            "SINDREP": "🏭 Certificado SIDREP",
             "AUTOCONTROL": "🧪 Certificado Autocontrol",
-            "AMBOS": "🧩 Certificados SINADER + SINDREP",
+            "AMBOS": "🧩 Certificados SINADER + SIDREP",
         }
         if "source_mode" not in st.session_state:
             st.session_state.source_mode = "AMBOS"
@@ -234,7 +246,7 @@ def main() -> None:
             if st.button(label, key=f"btn_mode_{mode}", use_container_width=True, type="primary" if selected else "secondary"):
                 st.session_state.source_mode = mode
         source = st.session_state.source_mode
-        st.caption(f"Modo actual: {source}")
+        st.caption(f"Modo actual: {source.replace('SINDREP', 'SIDREP')}")
         if source == "SINADER":
             st.caption("Tratamiento se normaliza usando catálogo Nivel 3 + ancla de cantidad (kg).")
         st.caption("Puedes subir PDFs o escoger carpeta desde explorador local (si ejecutas en tu PC).")
@@ -314,7 +326,7 @@ def main() -> None:
                 elif source == "SINDREP":
                     output = tmp / "sindrep_output.xlsx"
                     process_sindrep(str(input_dir), str(output))
-                    _render_preview_from_excel(output, "SINDREP")
+                    _render_preview_from_excel(output, "SIDREP")
                     data = output.read_bytes()
                     filename = output.name
                     mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -332,7 +344,7 @@ def main() -> None:
                     process_sindrep(str(input_dir), str(out_sindrep))
                     _render_sinader_extraction_details()
                     _render_preview_from_excel(out_sinader, "SINADER")
-                    _render_preview_from_excel(out_sindrep, "SINDREP")
+                    _render_preview_from_excel(out_sindrep, "SIDREP")
                     data = _zip_outputs([
                         (out_sinader.name, _read_file_bytes(out_sinader)),
                         (out_sindrep.name, _read_file_bytes(out_sindrep)),
@@ -384,7 +396,7 @@ def main() -> None:
             if source in {"SINDREP", "AMBOS"}:
                 out_sindrep = tmp / "sindrep_output.xlsx"
                 process_sindrep(str(input_dir), str(out_sindrep))
-                _render_preview_from_excel(out_sindrep, "SINDREP")
+                _render_preview_from_excel(out_sindrep, "SIDREP")
                 outputs.append((out_sindrep.name, _read_file_bytes(out_sindrep)))
 
     st.success(f"Proceso completado. PDFs procesados: {total}")
