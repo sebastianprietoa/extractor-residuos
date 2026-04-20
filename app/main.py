@@ -15,7 +15,7 @@ app = FastAPI(
     title="Extractor de Certificados",
     version="1.0.0",
     description=(
-        "API para procesar certificados PDF de SINADER y SINDREP.\n\n"
+        "API para procesar certificados PDF de SINADER y SIDREP.\n\n"
         "Sube uno o más PDF por endpoint y recibirás un archivo Excel con los datos extraídos."
     ),
 )
@@ -40,14 +40,14 @@ WEB_UI_HTML = """
     </style>
   </head>
   <body>
-    <h1>Extractor SINADER / SINDREP</h1>
+    <h1>Extractor SINADER / SIDREP</h1>
     <p class="muted">Selecciona una carpeta local con PDFs. El sistema sube los archivos y devuelve un Excel.</p>
 
     <div class="box">
       <label for="source">Tipo de extracción</label>
       <select id="source">
         <option value="sinader">SINADER</option>
-        <option value="sindrep">SINDREP</option>
+        <option value="sindrep">SIDREP</option>
       </select>
 
       <label for="folder">Carpeta con PDFs</label>
@@ -250,7 +250,7 @@ async def extract_sinader(
 
 @app.post(
     "/extract/sindrep",
-    summary="Extraer PDFs SINDREP a Excel",
+    summary="Extraer PDFs SIDREP a Excel",
     tags=["Extracción"],
     response_class=FileResponse,
     responses={
@@ -288,7 +288,7 @@ async def extract_sindrep(
         cleanup_temp_dir(temp_dir)
         raise HTTPException(
             status_code=500,
-            detail=f"Error procesando archivos SINDREP: {str(e)}"
+            detail=f"Error procesando archivos SIDREP: {str(e)}"
         )
     finally:
         for f in files:

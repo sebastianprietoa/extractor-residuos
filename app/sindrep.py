@@ -21,7 +21,8 @@ STD_COLS = [
     "Peligrosidad", "E. físico", "Contenedor", "Estado del Residuo", "Cantidad (Kg)",
 ]
 META_COLS = [
-    "Instalación", "Empresa destinataria", "FechaDeclaración", "Mes", "Año", "Archivo", "Ruta", "Clasificación DEFRA",
+    "Instalación", "Empresa destinataria", "FechaDeclaración", "Mes", "Año", "Archivo", "Ruta",
+    "DEFRA_English", "DEFRA_Español", "Clasificación DEFRA",
 ]
 MESES_ES = {
     1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril", 5: "Mayo", 6: "Junio",
@@ -89,6 +90,93 @@ def clasificar_defra(descripcion_residuo: str) -> str:
     if "alimento" in d or "comida" in d or "food" in d:
         return "Organic: food and drink waste"
     return "Commercial and industrial waste"
+
+
+SIDREP_CODE_TO_DEFRA_EN: Dict[str, str] = {
+    # Lista I
+    "I.1": "Commercial and industrial waste",
+    "I.2": "Commercial and industrial waste",
+    "I.3": "Commercial and industrial waste",
+    "I.4": "Commercial and industrial waste",
+    "I.5": "Wood",
+    "I.6": "Commercial and industrial waste",
+    "I.7": "Commercial and industrial waste",
+    "I.8": "Mineral oil",
+    "I.9": "Mineral oil",
+    "I.10": "Commercial and industrial waste",
+    "I.11": "Asphalt",
+    "I.12": "Commercial and industrial waste",
+    "I.13": "Commercial and industrial waste",
+    "I.14": "Commercial and industrial waste",
+    "I.15": "Commercial and industrial waste",
+    "I.16": "Commercial and industrial waste",
+    "I.17": "Metals",
+    "I.18": "Commercial and industrial waste",
+    # Lista II
+    "II.1": "Commercial and industrial waste",
+    "II.2": "Commercial and industrial waste",
+    "II.3": "Commercial and industrial waste",
+    "II.4": "Metals",
+    "II.5": "Metals",
+    "II.6": "Commercial and industrial waste",
+    "II.7": "Commercial and industrial waste",
+    "II.8": "Commercial and industrial waste",
+    "II.9": "Commercial and industrial waste",
+    "II.10": "Commercial and industrial waste",
+    "II.11": "Commercial and industrial waste",
+    "II.12": "Commercial and industrial waste",
+    "II.13": "Batteries",
+    "II.14": "Commercial and industrial waste",
+    "II.15": "Commercial and industrial waste",
+    "II.16": "Commercial and industrial waste",
+    "II.17": "Commercial and industrial waste",
+    "II.18": "Asbestos",
+    "II.19": "Commercial and industrial waste",
+    "II.20": "Commercial and industrial waste",
+    "II.21": "Commercial and industrial waste",
+    "II.22": "Commercial and industrial waste",
+    "II.23": "Commercial and industrial waste",
+    "II.24": "Commercial and industrial waste",
+    "II.25": "Commercial and industrial waste",
+    "II.26": "Commercial and industrial waste",
+    "II.27": "Commercial and industrial waste",
+    # Lista III
+    "III.1": "Commercial and industrial waste",
+    "III.2": "Commercial and industrial waste",
+    "III.3": "Household residual waste",
+    "III.4": "Soils",
+}
+
+SIDREP_CODE_TO_DEFRA_ES: Dict[str, str] = {
+    "Commercial and industrial waste": "Residuos comerciales e industriales",
+    "Wood": "Madera",
+    "Mineral oil": "Aceite mineral",
+    "Asphalt": "Asfalto",
+    "Metals": "Metales",
+    "Batteries": "Baterías",
+    "Asbestos": "Asbesto",
+    "Household residual waste": "Residuos domiciliarios residuales",
+    "Soils": "Suelos",
+}
+
+
+def _normalize_sidrep_code(codigo_principal: str) -> str:
+    code = _clean_spaces(codigo_principal).upper().replace(" ", "")
+    m = re.match(r"^(I{1,3})\.(\d{1,2})$", code)
+    if not m:
+        return ""
+    return f"{m.group(1)}.{int(m.group(2))}"
+
+
+def clasificar_defra_sidrep(codigo_principal: str) -> Tuple[str, str]:
+    code = _normalize_sidrep_code(codigo_principal)
+    default_en = "Commercial and industrial waste"
+    default_es = "Residuos comerciales e industriales"
+    if not code:
+        return default_en, default_es
+    defra_en = SIDREP_CODE_TO_DEFRA_EN.get(code, default_en)
+    defra_es = SIDREP_CODE_TO_DEFRA_ES.get(defra_en, default_es)
+    return defra_en, defra_es
 
 
 def extract_empresa_destinataria(full_text: str) -> str:
@@ -336,7 +424,11 @@ def process_folder(root_dir: str, output_xlsx: str) -> pd.DataFrame:
         anio = fecha_decl.year if fecha_decl else ""
         if rows:
             for r in rows:
-                r["Clasificación DEFRA"] = clasificar_defra(r.get("Descripción Residuo", ""))
+                defra_en, defra_es = clasificar_defra_sidrep(r.get("Código principal", ""))
+                r["DEFRA_English"] = defra_en
+                r["DEFRA_Español"] = defra_es
+                # Mantener compatibilidad con columnas/consumidores antiguos.
+                r["Clasificación DEFRA"] = defra_en
                 r["Instalación"] = instalacion
                 r["Empresa destinataria"] = empresa_dest
                 r["FechaDeclaración"] = fecha_decl.isoformat() if fecha_decl else ""
