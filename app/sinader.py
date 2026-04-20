@@ -2376,6 +2376,206 @@ def extract_any_pdf(pdf_path: str) -> Tuple[List[Dict[str, str]], Dict[str, str]
     return rows, meta, kind
 
 
+DEFRA_RESIDUO_CATEGORIAS = [
+    "Aggregates",
+    "Average construction",
+    "Asbestos",
+    "Asphalt",
+    "Bricks",
+    "Concrete",
+    "Insulation",
+    "Metals",
+    "Soils",
+    "Mineral oil",
+    "Plasterboard",
+    "Tyres",
+    "Wood",
+    "Books",
+    "Glass",
+    "Clothing",
+    "Household residual waste",
+    "Organic: food and drink waste",
+    "Organic: garden waste",
+    "Organic: mixed food and garden waste",
+    "Commercial and industrial waste",
+    "WEEE - fridges and freezers",
+    "WEEE - large",
+    "WEEE - mixed",
+    "WEEE - small",
+    "Batteries",
+    "Metal: aluminium cans and foil (excl. forming)",
+    "Metal: mixed cans",
+    "Metal: scrap metal",
+    "Metal: steel cans",
+    "Plastics: average plastics",
+    "Plastics: average plastic film",
+    "Plastics: average plastic rigid",
+    "Plastics: HDPE (incl. forming)",
+    "Plastics: LDPE and LLDPE (incl. forming)",
+    "Plastics: PET (incl. forming)",
+    "Plastics: PP (incl. forming)",
+    "Plastics: PS (incl. forming)",
+    "Plastics: PVC (incl. forming)",
+    "Paper and board: board",
+    "Paper and board: mixed",
+    "Paper and board: paper",
+]
+
+DEFRA_RESIDUO_ES = {
+    "Aggregates": "Áridos",
+    "Average construction": "Residuos de construcción promedio",
+    "Asbestos": "Asbesto",
+    "Asphalt": "Asfalto",
+    "Bricks": "Ladrillos",
+    "Concrete": "Hormigón",
+    "Insulation": "Aislantes",
+    "Metals": "Metales",
+    "Soils": "Suelos",
+    "Mineral oil": "Aceite mineral",
+    "Plasterboard": "Yeso-cartón",
+    "Tyres": "Neumáticos",
+    "Wood": "Madera",
+    "Books": "Libros",
+    "Glass": "Vidrio",
+    "Clothing": "Ropa",
+    "Household residual waste": "Residuos domiciliarios residuales",
+    "Organic: food and drink waste": "Residuos orgánicos de alimentos y bebidas",
+    "Organic: garden waste": "Residuos orgánicos de jardín",
+    "Organic: mixed food and garden waste": "Residuos orgánicos mixtos (alimentos y jardín)",
+    "Commercial and industrial waste": "Residuos comerciales e industriales",
+    "WEEE - fridges and freezers": "RAEE - refrigeradores y congeladores",
+    "WEEE - large": "RAEE - equipos grandes",
+    "WEEE - mixed": "RAEE - mixto",
+    "WEEE - small": "RAEE - equipos pequeños",
+    "Batteries": "Baterías",
+    "Metal: aluminium cans and foil (excl. forming)": "Metal: latas y foil de aluminio (excluye conformado)",
+    "Metal: mixed cans": "Metal: latas mixtas",
+    "Metal: scrap metal": "Metal: chatarra",
+    "Metal: steel cans": "Metal: latas de acero",
+    "Plastics: average plastics": "Plásticos: promedio",
+    "Plastics: average plastic film": "Plásticos: film promedio",
+    "Plastics: average plastic rigid": "Plásticos: rígido promedio",
+    "Plastics: HDPE (incl. forming)": "Plásticos: HDPE (incluye conformado)",
+    "Plastics: LDPE and LLDPE (incl. forming)": "Plásticos: LDPE y LLDPE (incluye conformado)",
+    "Plastics: PET (incl. forming)": "Plásticos: PET (incluye conformado)",
+    "Plastics: PP (incl. forming)": "Plásticos: PP (incluye conformado)",
+    "Plastics: PS (incl. forming)": "Plásticos: PS (incluye conformado)",
+    "Plastics: PVC (incl. forming)": "Plásticos: PVC (incluye conformado)",
+    "Paper and board: board": "Papel y cartón: cartón",
+    "Paper and board: mixed": "Papel y cartón mixto",
+    "Paper and board: paper": "Papel",
+}
+
+DEFRA_TRATAMIENTO_ES = {
+    "Re-use": "Reutilización",
+    "Open-loop": "Reciclaje circuito abierto",
+    "Closed-loop": "Reciclaje circuito cerrado",
+    "Combustion": "Combustión",
+    "Landfill": "Relleno sanitario / disposición en vertedero",
+    "Anaerobic digestion": "Digestión anaeróbica",
+}
+
+
+def derivar_ano_mes(periodo_declarado: str, fuente_pdf: str) -> Tuple[Optional[str], Optional[str]]:
+    periodo_txt = _clean_cell(periodo_declarado)
+    m = re.search(r"\b(\d{1,2})\s*[/\-]\s*(20\d{2})\b", periodo_txt)
+    if m:
+        mes = int(m.group(1))
+        anio = m.group(2)
+        if 1 <= mes <= 12:
+            return anio, f"{mes:02d}"
+    periodo_norm = _norm(periodo_txt)
+    year_match = re.search(r"\b(20\d{2})\b", periodo_norm)
+    month_num = _parse_spanish_month(periodo_norm)
+    if year_match and month_num:
+        return year_match.group(1), f"{month_num:02d}"
+    parsed = parse_period_from_filename(_clean_cell(fuente_pdf))
+    if parsed:
+        mm, yyyy = parsed.split("/")
+        return yyyy, mm
+    fuente_norm = _norm(fuente_pdf)
+    year_match_file = re.search(r"(20\d{2})", fuente_norm)
+    month_file = _parse_spanish_month(fuente_norm)
+    if year_match_file and month_file:
+        return year_match_file.group(1), f"{month_file:02d}"
+    return None, None
+
+
+def clasificar_defra_residuo(codigo_residuo: str, residuo_oficial: str) -> Optional[str]:
+    codigo = _normalize_code(codigo_residuo)
+    residuo_norm = _norm(residuo_oficial)
+    # Reglas determinísticas por código SINADER observado en corpus.
+    if codigo == "15 01 01":
+        return "Paper and board: mixed"
+    if codigo == "15 01 02":
+        return "Plastics: average plastics"
+    if codigo == "15 01 04":
+        # Convención única elegida: latas/metales de envases -> "Metal: mixed cans".
+        return "Metal: mixed cans"
+    if codigo == "15 01 06":
+        # Envases mezclados se reportan como flujo mixto C&I para mantener consistencia.
+        return "Commercial and industrial waste"
+    if codigo in {"19 08 05", "02 02 04"}:
+        # Lodos de PTAS/efluentes: flujo industrial para este proyecto.
+        return "Commercial and industrial waste"
+    if codigo in {"21 07 01", "21 07 09"}:
+        return "Organic: food and drink waste"
+    if codigo == "20 01 99":
+        return "Commercial and industrial waste"
+    if codigo == "10 01 01":
+        return "Commercial and industrial waste"
+    if codigo == "21 04 04":
+        return "Plastics: average plastics"
+    if codigo == "02 01 99":
+        return "Organic: mixed food and garden waste"
+    # Fallback determinístico por residuo oficial (sin fuzzy aleatorio).
+    if "papel" in residuo_norm or "carton" in residuo_norm:
+        return "Paper and board: mixed"
+    if "plast" in residuo_norm:
+        return "Plastics: average plastics"
+    if "metal" in residuo_norm:
+        return "Metal: mixed cans"
+    if "organ" in residuo_norm or "lodo" in residuo_norm:
+        return "Organic: food and drink waste"
+    if "ceniza" in residuo_norm or "escoria" in residuo_norm:
+        return "Commercial and industrial waste"
+    if "residuo no especificado" in residuo_norm or "fracciones no especificadas" in residuo_norm:
+        return "Commercial and industrial waste"
+    return None
+
+
+def traducir_defra_residuo(defra_residuo: str) -> Optional[str]:
+    key = _clean_cell(defra_residuo)
+    if not key:
+        return None
+    return DEFRA_RESIDUO_ES.get(key)
+
+
+def clasificar_defra_tratamiento(tratamiento: str) -> Optional[str]:
+    txt = _norm(tratamiento)
+    if not txt:
+        return None
+    if "degradacion anaerobica" in txt or "anaerobica" in txt or "compostaje" in txt:
+        return "Anaerobic digestion"
+    if "relleno sanitario" in txt or "disposicion final" in txt or "monorelleno" in txt:
+        return "Landfill"
+    if "residuos municipales asimilables a domiciliarios" in txt or "sitio de escombros de la construccion" in txt:
+        return "Landfill"
+    if "reciclaje" in txt:
+        return "Open-loop"
+    if "pretratamiento" in txt:
+        # Regla documentada: pretratamiento se aproxima a flujo previo de reciclaje.
+        return "Open-loop"
+    return None
+
+
+def traducir_defra_tratamiento(defra_tratamiento: str) -> Optional[str]:
+    key = _clean_cell(defra_tratamiento)
+    if not key:
+        return None
+    return DEFRA_TRATAMIENTO_ES.get(key)
+
+
 def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
     pdf_paths = sorted([str(p) for p in Path(input_folder).rglob("*.pdf")])
     if not pdf_paths:
@@ -2503,18 +2703,17 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
         lambda x: "SI" if _clean_cell(x) in {"heredada_base", "ajustada_tratamiento", "ajustada_regla_codigo"} else "NO"
     )
     df_v2 = pd.DataFrame({
-        "archivo": df.get("FuentePDF", pd.Series(dtype=str)).fillna("").astype(str),
-        "folio": df.get("Folio", pd.Series(dtype=str)).fillna(""),
-        "establecimiento": df.get("Establecimiento", pd.Series(dtype=str)).fillna(""),
-        "periodo_declarado": df.get("Periodo declarado", pd.Series(dtype=str)).fillna(""),
-        "fecha_declaracion": "",
+        "FuentePDF": df.get("FuentePDF", pd.Series(dtype=str)).fillna("").astype(str),
+        "Folio": df.get("Folio", pd.Series(dtype=str)).fillna(""),
+        "Establecimiento": df.get("Establecimiento", pd.Series(dtype=str)).fillna(""),
+        "Periodo declarado": df.get("Periodo declarado", pd.Series(dtype=str)).fillna(""),
         "sin_movimientos": df.get("Sin movimientos", pd.Series(dtype=str)).fillna("").astype(str).str.upper().map(
             {"SI": True, "TRUE": True, "YES": True, "NO": False, "FALSE": False}
         ),
-        "codigo_residuo": df.get("Código principal", pd.Series(dtype=str)).fillna(""),
-        "residuo": df.get("Descripción Residuo", pd.Series(dtype=str)).fillna(""),
-        "cantidad_kg": df.get("Cantidad (Kg)", pd.Series(dtype=float)).astype("float64"),
-        "tratamiento": df.get("Tratamiento", pd.Series(dtype=str)).fillna(""),
+        "Código principal": df.get("Código principal", pd.Series(dtype=str)).fillna(""),
+        "Residuo extraído": df.get("Descripción Residuo", pd.Series(dtype=str)).fillna(""),
+        "Cantidad (Kg)": df.get("Cantidad (Kg)", pd.Series(dtype=float)).astype("float64"),
+        "Tratamiento": df.get("Tratamiento", pd.Series(dtype=str)).fillna(""),
         "metodo_usado": df.get("Row_strategy", pd.Series(dtype=str)).fillna(""),
         "requiere_revision": (
             (df.get("Parsing_OK", pd.Series(dtype=str)).fillna("NO").astype(str).str.upper() != "SI")
@@ -2539,30 +2738,57 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
             if _norm(t) in txt_norm:
                 return t
         return txt
-    df_v2["tratamiento"] = df_v2["tratamiento"].apply(_normalizar_tratamiento_v2)
-    df_v2["residuo_extraido"] = df.get("Descripción Residuo Original", df_v2["residuo"]).fillna(df_v2["residuo"])
-    df_v2["residuo_oficial"] = df_v2["codigo_residuo"].map(lambda x: MAPA_RESIDUOS_SINADER_V2.get(_normalize_code(x), ""))
-    df_v2["residuo"] = df_v2["residuo_oficial"].where(df_v2["residuo_oficial"].astype(str).str.strip() != "", df_v2["residuo"])
+    df_v2["Tratamiento"] = df_v2["Tratamiento"].apply(_normalizar_tratamiento_v2)
+    df_v2["Residuo oficial"] = df_v2["Código principal"].map(lambda x: MAPA_RESIDUOS_SINADER_V2.get(_normalize_code(x), ""))
+    df_v2["Residuo oficial"] = df_v2["Residuo oficial"].where(
+        df_v2["Residuo oficial"].astype(str).str.strip() != "",
+        df_v2["Residuo extraído"],
+    )
     df_v2["codigo_sin_mapa_residuo"] = (
-        df_v2["codigo_residuo"].astype(str).str.strip() != ""
-    ) & (df_v2["residuo_oficial"].astype(str).str.strip() == "")
+        df_v2["Código principal"].astype(str).str.strip() != ""
+    ) & (~df_v2["Código principal"].astype(str).map(lambda x: _normalize_code(x) in MAPA_RESIDUOS_SINADER_V2))
+    # Año/Mes desde Periodo declarado; fallback al nombre del archivo.
+    anio_mes = [
+        derivar_ano_mes(periodo_declarado=r.get("Periodo declarado", ""), fuente_pdf=r.get("FuentePDF", ""))
+        for _, r in df_v2.iterrows()
+    ]
+    df_v2["Año"] = [x[0] for x in anio_mes]
+    df_v2["Mes"] = [x[1] for x in anio_mes]
+    # Clasificación DEFRA por residuo y tratamiento (determinística para códigos del corpus SINADER).
+    df_v2["DEFRA_Residuo"] = df_v2.apply(
+        lambda r: clasificar_defra_residuo(r.get("Código principal", ""), r.get("Residuo oficial", "")),
+        axis=1,
+    )
+    df_v2["DEFRA_Residuo_ES"] = df_v2["DEFRA_Residuo"].apply(traducir_defra_residuo)
+    df_v2["DEFRA_Tratamiento"] = df_v2["Tratamiento"].apply(clasificar_defra_tratamiento)
+    df_v2["DEFRA_Tratamiento_ES"] = df_v2["DEFRA_Tratamiento"].apply(traducir_defra_tratamiento)
     df_v2["requiere_revision"] = (
         df_v2["requiere_revision"]
         | df_v2["codigo_sin_mapa_residuo"]
+        | df_v2["DEFRA_Residuo"].isna()
+        | df_v2["DEFRA_Tratamiento"].isna()
         | df_v2["observacion"].astype(str).str.strip().ne("")
+    )
+    df_v2["observacion"] = df_v2["observacion"].astype(str)
+    df_v2.loc[df_v2["DEFRA_Residuo"].isna(), "observacion"] = (
+        df_v2["observacion"].where(df_v2["observacion"].astype(str).str.strip() != "", "Pendiente DEFRA_Residuo")
+    )
+    df_v2.loc[df_v2["DEFRA_Tratamiento"].isna(), "observacion"] = (
+        df_v2["observacion"].where(df_v2["observacion"].astype(str).str.strip() != "", "Pendiente DEFRA_Tratamiento")
     )
     df_v2["sin_movimientos"] = df_v2["sin_movimientos"].where(df_v2["sin_movimientos"].notna(), False)
     export_cols = [
-        "archivo", "folio", "establecimiento", "periodo_declarado", "fecha_declaracion",
-        "sin_movimientos", "codigo_residuo", "residuo", "residuo_extraido", "residuo_oficial",
-        "cantidad_kg", "tratamiento", "metodo_usado", "requiere_revision", "codigo_sin_mapa_residuo",
-        "observacion", "fila_original",
+        "Año", "Mes", "Código principal", "Residuo oficial", "Cantidad (Kg)", "Tratamiento",
+        "DEFRA_Residuo", "DEFRA_Residuo_ES", "DEFRA_Tratamiento", "DEFRA_Tratamiento_ES",
+        "FuentePDF", "Folio", "Establecimiento", "fila_original", "metodo_usado",
+        "requiere_revision", "observacion",
+        "Periodo declarado", "sin_movimientos", "Residuo extraído", "codigo_sin_mapa_residuo",
     ]
     df_v2 = df_v2[export_cols]
-    df_ok = df_v2[(df_v2["sin_movimientos"] == False) & (df_v2["codigo_residuo"].astype(str).str.strip() != "")].copy()
+    df_ok = df_v2[(df_v2["sin_movimientos"] == False) & (df_v2["Código principal"].astype(str).str.strip() != "")].copy()
     df_revision = df_v2[
         (df_v2["observacion"].astype(str).str.strip() != "")
-        | (df_v2["tratamiento"].astype(str).str.strip() == "")
+        | (df_v2["Tratamiento"].astype(str).str.strip() == "")
         | (df_v2["requiere_revision"] == True)
         | (df_v2["codigo_sin_mapa_residuo"] == True)
     ].copy()
