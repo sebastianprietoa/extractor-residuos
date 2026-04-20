@@ -189,7 +189,11 @@ def _render_preview_from_excel(path: Path, title: str) -> None:
         st.warning(f"No se pudo generar previsualización de {title}: {exc}")
         return
     st.markdown(f"#### 👀 Previsualización — {title}")
-    preferred = [c for c in ["FuentePDF", "N.", "Descripción Residuo", "Código principal", "Cantidad (Kg)", "Tratamiento", "Destino", "Transportista", "Patente", "DEFRA"] if c in df.columns]
+    preferred = [c for c in [
+        "FuentePDF", "N.", "Descripción Residuo", "Código principal", "Cantidad (Kg)",
+        "Tratamiento", "Destino", "Transportista", "Patente",
+        "DEFRA_English", "DEFRA_Español", "Clasificación DEFRA", "DEFRA",
+    ] if c in df.columns]
     view = df[preferred] if preferred else df
     st.dataframe(view.head(20), use_container_width=True)
 
