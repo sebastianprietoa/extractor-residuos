@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import io
 import os
+import sys
 import tempfile
 import zipfile
 from pathlib import Path
 from typing import Iterable
+
+# Permite ejecutar `streamlit run app/streamlit_app.py` desde WSL o Windows
+# sin depender de que el directorio padre quede agregado a sys.path.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import pandas as pd
 import streamlit as st
@@ -13,6 +20,8 @@ import streamlit as st
 from app.autocontrol import process_folder as process_autocontrol
 from app.sinader import process_folder as process_sinader
 from app.sindrep import process_folder as process_sindrep
+from app.simapro import process_folder as process_simapro
+from app.ui_state import clear_selection, ensure_selection_state
 
 
 st.set_page_config(
@@ -37,22 +46,6 @@ def _logo_source(filename: str, env_var: str, default_url: str | None = None) ->
     if local_path.exists():
         return str(local_path)
     return default_url
-
-
-def _pick_folder_with_explorer() -> str:
-    """Abre selector de carpetas local (solo útil cuando Streamlit corre en tu PC)."""
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        folder = filedialog.askdirectory(title="Selecciona carpeta con certificados PDF")
-        root.destroy()
-        return folder or ""
-    except Exception:
-        return ""
 
 
 def _extract_zip_to_input(zip_bytes: bytes, input_dir: Path) -> int:
@@ -223,12 +216,100 @@ def _render_sinader_extraction_details() -> None:
         )
 
 
+def _safe_relative_parts(filename: str) -> list[str]:
+    normalized = filename.replace("\\", "/").strip("/")
+    parts: list[str] = []
+    for part in normalized.split("/"):
+        if not part or part in {".", ".."}:
+            continue
+        if ":" in part:
+            continue
+        parts.append(part)
+    return parts
+
+
+def _save_uploads_generic(
+    uploaded_files: Iterable[object],
+    input_dir: Path,
+    *,
+    allowed_suffixes: set[str],
+    preserve_structure: bool,
+) -> int:
+    count = 0
+    for idx, upload in enumerate(uploaded_files, start=1):
+        filename = getattr(upload, "name", "")
+        if not filename:
+            continue
+        original_name = Path(filename).name
+        if original_name.startswith("~$"):
+            continue
+        if Path(original_name).suffix.lower() not in allowed_suffixes:
+            continue
+
+        if preserve_structure:
+            parts = _safe_relative_parts(filename)
+            dst = input_dir.joinpath(*parts) if parts else input_dir / original_name
+        else:
+            dst = input_dir / f"{idx:03d}_{original_name}"
+
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(upload.getbuffer())
+        count += 1
+    return count
+
+
+def _compatible_uploaded_files(uploaded_files: Iterable[object], allowed_suffixes: set[str]) -> list[object]:
+    compatible: list[object] = []
+    for upload in uploaded_files:
+        filename = getattr(upload, "name", "")
+        if not filename:
+            continue
+        original_name = Path(filename).name
+        if original_name.startswith("~$"):
+            continue
+        if Path(original_name).suffix.lower() not in allowed_suffixes:
+            continue
+        compatible.append(upload)
+    return compatible
+
+
+def _extract_zip_to_input_generic(
+    zip_bytes: bytes,
+    input_dir: Path,
+    *,
+    allowed_suffixes: set[str],
+    preserve_tree: bool,
+) -> int:
+    count = 0
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        for name in zf.namelist():
+            p = Path(name)
+            if not p.name:
+                continue
+            if p.suffix.lower() not in allowed_suffixes:
+                continue
+            if p.name.startswith("~$"):
+                continue
+
+            if preserve_tree:
+                parts = _safe_relative_parts(name)
+                dst = input_dir.joinpath(*parts) if parts else input_dir / p.name
+            else:
+                dst = input_dir / f"{count + 1:03d}_{p.name}"
+
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(zf.read(name))
+            count += 1
+    return count
+
+
 def main() -> None:
     _render_header()
     st.markdown("---")
 
-    if "uploader_nonce" not in st.session_state:
-        st.session_state.uploader_nonce = 0
+    ensure_selection_state(st.session_state)
+    if "source_mode" not in st.session_state:
+        st.session_state.source_mode = "AMBOS"
 
     with st.sidebar:
         st.header("⚙️ Configuración")
@@ -236,10 +317,9 @@ def main() -> None:
             "SINADER": "♻️ Certificado SINADER",
             "SINDREP": "🏭 Certificado SIDREP",
             "AUTOCONTROL": "🧪 Certificado Autocontrol",
+            "SIMAPRO": "📊 SimaPro XLSX",
             "AMBOS": "🧩 Certificados SINADER + SIDREP",
         }
-        if "source_mode" not in st.session_state:
-            st.session_state.source_mode = "AMBOS"
         st.caption("Selecciona función")
         for mode, label in source_labels.items():
             selected = st.session_state.source_mode == mode
@@ -249,49 +329,94 @@ def main() -> None:
         st.caption(f"Modo actual: {source.replace('SINDREP', 'SIDREP')}")
         if source == "SINADER":
             st.caption("Tratamiento se normaliza usando catálogo Nivel 3 + ancla de cantidad (kg).")
-        st.caption("Puedes subir PDFs o escoger carpeta desde explorador local (si ejecutas en tu PC).")
+        elif source == "SIMAPRO":
+            st.caption("Trabaja con XLSX/XLSM exportados desde SimaPro. Usa ZIP o carpeta local para conservar la estructura.")
+        else:
+            st.caption("Puedes subir PDFs o escoger carpeta desde explorador local (si ejecutas en tu PC).")
         branding_logo = _logo_source("logo_right.png", "GT_LOGO_RIGHT_URL", DEFAULT_RIGHT_LOGO_URL)
         if branding_logo:
             st.image(branding_logo, use_container_width=True)
 
+    if source == "SIMAPRO":
+        allowed_suffixes = {".xlsx", ".xlsm"}
+        file_types = ["xlsx", "xlsm"]
+        file_kind = "Excel"
+        file_count_label = "XLSX compatibles"
+        file_prompt = "📎 Arrastra una carpeta o selecciona múltiples archivos Excel"
+        zip_prompt = "📦 Selecciona un ZIP con una carpeta completa de Excel"
+        process_label = "Procesando Excel..."
+        empty_warning = "Debes subir al menos un archivo Excel."
+        incompatible_warning = "No se encontraron archivos Excel válidos en los archivos cargados."
+        zip_empty_warning = "El ZIP no contiene archivos Excel válidos."
+        summary_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    else:
+        allowed_suffixes = {".pdf"}
+        file_types = ["pdf"]
+        file_kind = "PDF"
+        file_count_label = "PDFs compatibles"
+        file_prompt = "📎 Arrastra una carpeta o selecciona múltiples PDFs"
+        zip_prompt = "📦 Selecciona un ZIP con una carpeta completa de PDFs"
+        process_label = "Procesando PDFs..."
+        empty_warning = "Debes subir al menos un PDF."
+        incompatible_warning = "No se encontraron PDFs válidos en los archivos cargados."
+        zip_empty_warning = "El ZIP no contiene PDFs válidos."
+        summary_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
     st.markdown("<div class='box'>", unsafe_allow_html=True)
     input_mode = st.radio(
         "Modo de entrada",
-        options=["Subir PDFs (explorador)", "Subir carpeta ZIP (explorador local)"],
+        options=["Subir archivos (explorador)", "Subir carpeta ZIP (explorador local)", "Seleccionar carpeta local"],
         horizontal=True,
     )
-    uploads = []
+
+    uploads: list[object] = []
+    folder_uploads: list[object] = []
     zip_upload = None
     uploader_nonce = st.session_state.uploader_nonce
-    if input_mode == "Subir PDFs (explorador)":
+
+    if input_mode == "Subir archivos (explorador)":
         uploads = st.file_uploader(
-            "📎 Arrastra una carpeta o selecciona múltiples PDFs",
-            type=["pdf"],
+            file_prompt,
+            type=file_types,
             accept_multiple_files=True,
-            help="Abre la carpeta local en el explorador y selecciona todos los PDFs.",
-            key=f"pdf_uploader_{uploader_nonce}",
+            help="Abre la carpeta local en el explorador y selecciona todos los archivos compatibles.",
+            key=f"file_uploader_{uploader_nonce}",
         )
-    else:
+    elif input_mode == "Subir carpeta ZIP (explorador local)":
         zip_upload = st.file_uploader(
-            "📦 Selecciona un ZIP con una carpeta completa de PDFs",
+            zip_prompt,
             type=["zip"],
             accept_multiple_files=False,
             help="Desde el explorador, comprime la carpeta en .zip y súbela aquí.",
             key=f"zip_uploader_{uploader_nonce}",
         )
+    else:
+        folder_uploads = st.file_uploader(
+            f"📂 Selecciona una carpeta local con {file_kind} compatibles",
+            type=file_types,
+            accept_multiple_files="directory",
+            help="El navegador abrirá un selector de carpetas local. Se procesarán solo los archivos compatibles.",
+            key=f"folder_uploader_{uploader_nonce}",
+        )
+        st.caption(f"Se procesarán solo {file_count_label.lower()} dentro de la carpeta seleccionada.")
+        if st.button("🧹 Limpiar carpeta", use_container_width=True, key="clear_folder_button"):
+            clear_selection(st.session_state)
+            st.rerun()
 
-    if st.button("🧹 Limpiar certificados cargados", use_container_width=True):
-        st.session_state.uploader_nonce += 1
+    if st.button("🧹 Limpiar selección", use_container_width=True, key="clear_selection_button"):
+        clear_selection(st.session_state)
         st.rerun()
 
     run = st.button("✨ Procesar y descargar", type="primary", use_container_width=True)
-    total_files = len(uploads or []) if input_mode == "Subir PDFs (explorador)" else 0
-    total_size_mb = round(sum(getattr(f, "size", 0) for f in (uploads or [])) / (1024 * 1024), 2)
+    selected_uploads = list(folder_uploads or uploads or [])
+    compatible_uploads = _compatible_uploaded_files(selected_uploads, allowed_suffixes)
+    total_files = len(compatible_uploads)
+    total_size_mb = round(sum(getattr(f, "size", 0) for f in compatible_uploads) / (1024 * 1024), 2)
     st.markdown(
         f"""
         <div class="quick-stats">
             <div class="quick-item"><b>{source}</b>Modo seleccionado</div>
-            <div class="quick-item"><b>{total_files}</b>PDFs cargados</div>
+            <div class="quick-item"><b>{total_files}</b>{file_count_label}</div>
             <div class="quick-item"><b>{total_size_mb} MB</b>Peso total</div>
         </div>
         """,
@@ -304,16 +429,36 @@ def main() -> None:
 
     if input_mode == "Subir carpeta ZIP (explorador local)":
         if not zip_upload:
-            st.warning("Debes subir un archivo ZIP con PDFs.")
+            st.warning(f"Debes subir un archivo ZIP con {file_kind}s.")
             return
         with st.spinner("Procesando carpeta ZIP..."):
             with tempfile.TemporaryDirectory(prefix="streamlit_extract_folder_") as temp_dir:
                 tmp = Path(temp_dir)
                 input_dir = tmp / "input"
                 input_dir.mkdir(parents=True, exist_ok=True)
-                total = _extract_zip_to_input(zip_upload.getvalue(), input_dir)
+                total = _extract_zip_to_input_generic(
+                    zip_upload.getvalue(),
+                    input_dir,
+                    allowed_suffixes=allowed_suffixes,
+                    preserve_tree=source == "SIMAPRO",
+                )
                 if total == 0:
-                    st.warning("El ZIP no contiene PDFs válidos.")
+                    st.warning(zip_empty_warning)
+                    return
+                if source == "SIMAPRO":
+                    output = tmp / "simapro_output.xlsx"
+                    process_simapro(str(input_dir), str(output))
+                    df = _render_preview_from_excel(output, "SIMAPRO")
+                    if df is not None and df.empty:
+                        st.warning("Se detectaron archivos Excel, pero no se encontraron registros compatibles en la hoja procesada.")
+                    st.success(f"Proceso SIMAPRO completado desde carpeta ZIP. {total} archivos compatibles procesados.")
+                    st.download_button(
+                        "Descargar resultado",
+                        data=output.read_bytes(),
+                        file_name=output.name,
+                        mime=summary_mime,
+                        use_container_width=True,
+                    )
                     return
                 if source == "SINADER":
                     output = tmp / "sinader_output.xlsx"
@@ -322,21 +467,21 @@ def main() -> None:
                     _render_preview_from_excel(output, "SINADER")
                     data = output.read_bytes()
                     filename = output.name
-                    mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    mime = summary_mime
                 elif source == "SINDREP":
                     output = tmp / "sindrep_output.xlsx"
                     process_sindrep(str(input_dir), str(output))
                     _render_preview_from_excel(output, "SIDREP")
                     data = output.read_bytes()
                     filename = output.name
-                    mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    mime = summary_mime
                 elif source == "AUTOCONTROL":
                     output = tmp / "autocontrol_output.xlsx"
                     process_autocontrol(str(input_dir), str(output))
                     _render_preview_from_excel(output, "AUTOCONTROL")
                     data = output.read_bytes()
                     filename = output.name
-                    mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    mime = summary_mime
                 else:
                     out_sinader = tmp / "sinader_output.xlsx"
                     out_sindrep = tmp / "sindrep_output.xlsx"
@@ -346,8 +491,8 @@ def main() -> None:
                     _render_preview_from_excel(out_sinader, "SINADER")
                     _render_preview_from_excel(out_sindrep, "SIDREP")
                     data = _zip_outputs([
-                        (out_sinader.name, _read_file_bytes(out_sinader)),
-                        (out_sindrep.name, _read_file_bytes(out_sindrep)),
+                        (out_sinader.name, out_sinader.read_bytes()),
+                        (out_sindrep.name, out_sindrep.read_bytes()),
                     ])
                     filename = "resultados_extraccion.zip"
                     mime = "application/zip"
@@ -355,19 +500,48 @@ def main() -> None:
         st.download_button("Descargar resultado", data=data, file_name=filename, mime=mime, use_container_width=True)
         return
 
-    if not uploads:
-        st.warning("Debes subir al menos un PDF.")
+    if not selected_uploads:
+        st.warning(empty_warning)
         return
 
-    with st.spinner("Procesando PDFs..."):
+    if not compatible_uploads:
+        st.error(incompatible_warning)
+        return
+
+    with st.spinner(process_label):
         with tempfile.TemporaryDirectory(prefix="streamlit_extract_") as temp_dir:
             tmp = Path(temp_dir)
             input_dir = tmp / "input"
             input_dir.mkdir(parents=True, exist_ok=True)
 
-            total = _save_uploads(uploads, input_dir)
+            if source == "SIMAPRO":
+                total = _save_uploads_generic(
+                    compatible_uploads,
+                    input_dir,
+                    allowed_suffixes=allowed_suffixes,
+                    preserve_structure=input_mode == "Seleccionar carpeta local",
+                )
+            else:
+                total = _save_uploads(compatible_uploads, input_dir)
+
             if total == 0:
-                st.error("No se encontraron PDFs válidos en los archivos cargados.")
+                st.error(incompatible_warning)
+                return
+
+            if source == "SIMAPRO":
+                output = tmp / "simapro_output.xlsx"
+                process_simapro(str(input_dir), str(output))
+                df = _render_preview_from_excel(output, "SIMAPRO")
+                if df is not None and df.empty:
+                    st.warning("Se detectaron archivos Excel, pero no se encontraron registros compatibles en la hoja procesada.")
+                st.success(f"Proceso SIMAPRO completado. {total} archivos compatibles procesados.")
+                st.download_button(
+                    label="Descargar Excel SIMAPRO",
+                    data=output.read_bytes(),
+                    file_name=output.name,
+                    mime=summary_mime,
+                    use_container_width=True,
+                )
                 return
 
             if source == "AUTOCONTROL":
@@ -380,7 +554,7 @@ def main() -> None:
                     label="Descargar Excel AUTOCONTROL",
                     data=data,
                     file_name=output.name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    mime=summary_mime,
                     use_container_width=True,
                 )
                 return
@@ -418,7 +592,7 @@ def main() -> None:
         label="Descargar Excel",
         data=data,
         file_name=name,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        mime=summary_mime,
         use_container_width=True,
     )
 
