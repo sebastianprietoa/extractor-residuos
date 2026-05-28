@@ -3,7 +3,7 @@ import unicodedata
 import logging
 import os
 import glob
-import importlib
+import importlib.util
 import json
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
@@ -48,17 +48,30 @@ MASTER_RESIDUOS: Dict[str, List[str]] = {
     "02 01 99": ["Residuos no especificados en otra categoría"],
     "02 02 04": ["Lodos del tratamiento in situ de efluentes"],
     "10 01 01": ["Cenizas del hogar, escorias y polvo de caldera (excepto el polvo de caldera especificado en el código 10 01 04)"],
+    "16 12 02": ["Mezcla de residuos provenientes de actividades de acuicultura"],
+    "16 12 03": ["Mezcla de residuos provenientes de actividades de pesca"],
     "15 01 01": ["Envases de papel y cartón"],
     "15 01 02": ["Envases de plástico"],
     "15 01 04": ["Envases metálicos"],
     "19 08 05": ["Lodos del tratamiento de aguas residuales urbanas"],
+    "20 01 01": ["Papel y cartón"],
+    "20 01 02": ["Vidrio"],
+    "20 01 25": ["Aceites y grasas comestibles"],
+    "20 01 39": ["PlÃ¡sticos"],
+    "20 01 38": ["Madera distinta de la especificada en el código 20 01 37"],
+    "20 01 40": ["Metales"],
     "20 01 99": ["Otras fracciones no especificadas en otra categoría"],
+    "20 03 01": ["Mezclas de residuos municipales"],
+    "21 04 01": ["Residuos orgánicos de actividades de acuicultura (fouling, incrustaciones biológicas, mortalidad y vísceras)"],
+    "21 04 02": ["Residuos de boyas y flotadores (incluye poliestireno expandido)"],
+    "21 04 03": ["Residuos de redes y cabos"],
     "21 04 04": ["Residuos de plásticos (HDPE, PEE, PETE, PVC) excepto planzas, boyas, flotadores, redes y cabos."],
+    "21 04 05": ["Residuos de planzas"],
 }
 
 DEFAULT_CATALOG_PATH = Path("assets/sinader_codigos.xlsx")
 PREFERRED_CATALOG_SHEETS = ("LER_completo_842",)
-TREATMENT_CATALOG_SHEET = "Tratamiento_SINADER"
+TREATMENT_CATALOG_SHEET = "Tratamientos_SINADER"
 DEFAULT_TREATMENT_DEFRA_MAP = {
     "reutilizacion": "Re-use",
     "reciclaje": "Open-loop",
@@ -141,43 +154,51 @@ STRONG_TREATMENT_CATALOG = [
     "Aplicación a suelo",
     "Monorelleno",
     "Compostaje",
+    "Preparación para reutilización",
+    "Valorización",
     "Pretratamiento",
     "Residuos voluminosos",
 ]
 KNOWN_SINADER_CODES = {
     "15 01 01", "15 01 02", "15 01 04", "20 01 99", "19 08 05", "10 01 01", "21 04 04", "02 02 04",
     "02 01 99", "02 01 02", "02 02 02", "02 02 03", "20 01 39", "15 01 06", "21 07 09", "21 07 01",
+    "16 12 02", "16 12 03", "20 01 01", "20 01 02", "20 01 25", "20 01 38", "20 01 40", "20 03 01",
+    "21 04 01", "21 04 02", "21 04 03", "21 04 05",
 }
 V2_FIN_TABLA_PATTERNS = [
     "La integridad y veracidad de la información",
     "DECLARACIÓN MENSUAL DE RESIDUOS NO PELIGROSOS",
     "Documento generado electrónicamente",
 ]
-TRATAMIENTOS_CONOCIDOS_V2 = sorted([
-    "Reciclaje de papel, cartón y productos de papel",
-    "Residuos municipales asimilables a domiciliarios",
-    "Sitio de Escombros de la Construcción",
-    "Recepción de Lodos en PTAS",
-    "Degradación Anaeróbica",
-    "Reciclaje de plásticos",
-    "Reciclaje de metales",
-    "Disposición final",
-    "Relleno sanitario",
-    "Pretratamiento",
-    "Monorelleno",
-    "Compostaje",
-], key=len, reverse=True)
+TRATAMIENTOS_CONOCIDOS_V2 = sorted(
+    list(dict.fromkeys(STRONG_TREATMENT_CATALOG)),
+    key=len,
+    reverse=True,
+)
 MAPA_RESIDUOS_SINADER_V2 = {
     "02 01 99": "Residuos no especificados en otra categoría",
     "02 02 04": "Lodos del tratamiento in situ de efluentes",
     "10 01 01": "Cenizas del hogar, escorias y polvo de caldera (excepto el polvo de caldera especificado en el código 10 01 04)",
+    "16 12 02": "Mezcla de residuos provenientes de actividades de acuicultura",
+    "16 12 03": "Mezcla de residuos provenientes de actividades de pesca",
     "15 01 01": "Envases de papel y cartón",
     "15 01 02": "Envases de plástico",
     "15 01 04": "Envases metálicos",
     "15 01 06": "Envases mezclados",
     "19 08 05": "Lodos del tratamiento de aguas residuales urbanas",
+    "20 01 01": "Papel y cartón",
+    "20 01 02": "Vidrio",
+    "20 01 25": "Aceites y grasas comestibles",
+    "20 01 39": "PlÃ¡sticos",
+    "20 01 38": "Madera distinta de la especificada en el código 20 01 37",
+    "20 01 40": "Metales",
     "20 01 99": "Otras fracciones no especificadas en otra categoría",
+    "20 03 01": "Mezclas de residuos municipales",
+    "21 04 01": "Residuos orgánicos de actividades de acuicultura (fouling, incrustaciones biológicas, mortalidad y vísceras)",
+    "21 04 02": "Residuos de boyas y flotadores (incluye poliestireno expandido)",
+    "21 04 03": "Residuos de redes y cabos",
     "21 04 04": "Residuos de plásticos (HDPE, PEE, PETE, PVC) excepto planzas, boyas, flotadores, redes y cabos",
+    "21 04 05": "Residuos de planzas",
     "21 07 01": "Residuos orgánicos (ejemplo como conchas, algas, carne, entre otros; incluye mortalidad)",
     "21 07 09": "Lodos orgánicos (ejemplo fecas y alimento no consumido)",
 }
@@ -758,6 +779,10 @@ def normalizar_fila_original(fila: str) -> str:
 def encontrar_tratamiento_en_texto(texto: str) -> Optional[str]:
     texto_norm = re.sub(r"\s+", " ", texto).strip().lower()
     texto_folded = _norm(texto_norm)
+    if re.search(r"preparacion\s+para\s+(?:la\s+)?reutilizacion", texto_folded):
+        return "Preparación para reutilización"
+    if re.search(r"pretratamiento\s+(?:de\s+)?vidrio\b", texto_folded):
+        return "Pretratamiento vidrio"
     for t in TRATAMIENTOS_CONOCIDOS_V2:
         if _norm(t) in texto_folded:
             return t
@@ -771,6 +796,9 @@ def encontrar_tratamiento_en_texto(texto: str) -> Optional[str]:
         return "Monorelleno"
     if "compostaje" in texto_norm:
         return "Compostaje"
+    specific_pretratamiento = _infer_specific_pretratamiento("Pretratamiento", texto, TRATAMIENTOS_CONOCIDOS_V2)
+    if _norm(specific_pretratamiento) not in {"", "pretratamiento"}:
+        return specific_pretratamiento
     if "pretratamiento" in texto_norm:
         return "Pretratamiento"
     if "relleno sanitario" in texto_norm:
@@ -792,6 +820,51 @@ def inferir_tratamiento_por_codigo(codigo: str, fila_completa: str = "", resto_p
     fila_norm = re.sub(r"\s+", " ", fila_completa).strip().lower()
     resto_norm = re.sub(r"\s+", " ", resto_post_cantidad).strip().lower()
     combinado = f"{fila_norm} {resto_norm}"
+    combinado_norm = _norm(combinado)
+    if codigo == "21 04 01":
+        if (
+            "reciclaje" in combinado_norm
+            or "hidrobiolog" in combinado_norm
+            or "consumo animal" in combinado_norm
+            or "pesquera" in combinado_norm
+        ):
+            return "Reciclaje de residuos hidrobiológicos para consumo animal"
+    if codigo == "20 01 01":
+        if (
+            ("papel" in combinado_norm and "carton" in combinado_norm)
+            or "productos de papel" in combinado_norm
+        ):
+            return "Pretratamiento de papel, cartón y productos de papel"
+    if codigo == "20 01 25":
+        if (
+            "aceite" in combinado_norm
+            or "grasas comestibles" in combinado_norm
+            or "rendering chile" in combinado_norm
+        ):
+            return "Pretratamiento de aceites y grasas comestibles"
+    if codigo == "21 04 02":
+        if (
+            "reciclaje" in combinado_norm
+            and (
+                "boyas" in combinado_norm
+                or "flotadores" in combinado_norm
+                or "poliestireno" in combinado_norm
+                or "greenspot" in combinado_norm
+                or "aysen recircular" in combinado_norm
+            )
+        ):
+            return "Reciclaje de plásticos"
+    if codigo == "21 04 05":
+        if (
+            "preparacion para la" in combinado_norm
+            or ("preparacion para" in combinado_norm and "reutilizacion" in combinado_norm)
+        ):
+            return "Preparación para reutilización"
+    if codigo in {"20 01 39", "21 04 04"}:
+        if "preparacion para" in combinado_norm and "reutilizacion" in combinado_norm:
+            return "Preparación para reutilización"
+        if "valorizacion" in combinado_norm:
+            return "Valorización"
     if codigo == "15 01 02":
         if (
             "reciclaje de plásticos" in combinado
@@ -1561,6 +1634,14 @@ def extract_global_treatment_from_text(full_text: str, known_treatments: Optiona
             term_norm = _norm(term)
             if term_norm and term_norm in text_norm:
                 return term
+    specific_pretratamiento = _infer_specific_pretratamiento(
+        "Pretratamiento",
+        text,
+        known_treatments or TRATAMIENTOS_CONOCIDOS_V2,
+        require_pretratamiento_keyword=True,
+    )
+    if _norm(specific_pretratamiento) not in {"", "pretratamiento"}:
+        return specific_pretratamiento
     patterns = [
         r"(?:tipo\s*tratamiento|tratamiento)\s*[:\-]?\s*(reutilizaci[oó]n|reciclaje|combusti[oó]n|vertedero|anaerobic digestion)",
         r"(?:tipo\s*tratamiento|tratamiento)\s*[:\-]?\s*([A-Za-zÁÉÍÓÚÜÑáéíóúüñ\s]{4,60})",
@@ -1635,6 +1716,7 @@ def _sanitize_treatment_and_logistics(
             r"aplicaci[oó]n\s+a\s+suelo",
             r"monorelleno",
             r"compostaje",
+            r"preparaci[oó]n\s+para\s+(?:la\s+)?reutilizaci[oó]n",
             r"pretratamiento",
             r"residuos\s+voluminosos",
             r"reutilizaci[oó]n",
@@ -1793,9 +1875,18 @@ def _sanitize_treatment_and_logistics(
             if candidate_dst and _is_placeholder_destination(dst):
                 dst = candidate_dst
 
+        trt = _infer_specific_pretratamiento(trt, " ".join([raw_combined, dst, descripcion]), known_treatments)
+
         if dst:
             dst = re.sub(r"\d+\|", " ", dst)
             dst = _clean_destination_noise(_clean_cell(re.sub(r"\s+", " ", dst)))
+
+        if dst and known_treatments:
+            dst_norm = _norm(dst)
+            trt_norm = _norm(trt)
+            known_treatment_norms = {_norm(x) for x in known_treatments if _clean_cell(x)}
+            if dst_norm and (dst_norm == trt_norm or dst_norm in known_treatment_norms or dst_norm == "reutilizacion"):
+                dst = ""
 
     return trt, dst, trp, pat
 
@@ -2151,20 +2242,29 @@ def load_treatment_level3_terms(catalog_path: Optional[str] = None) -> List[str]
             excel_file = pd.ExcelFile(path)
             if TREATMENT_CATALOG_SHEET not in excel_file.sheet_names:
                 continue
-            df = pd.read_excel(path, sheet_name=TREATMENT_CATALOG_SHEET)
+            df = pd.read_excel(path, sheet_name=TREATMENT_CATALOG_SHEET, header=2)
             normalized_cols = {_norm(c): c for c in df.columns}
+            level2_col = None
             level3_col = None
-            for candidate in ["nivel 3", "nivel3", "level 3", "tratamiento", "treatment"]:
+            for candidate in ["nivel 2", "nivel2", "level 2", "tratamiento", "treatment"]:
+                if candidate in normalized_cols:
+                    level2_col = normalized_cols[candidate]
+                    break
+            for candidate in ["nivel 3", "nivel3", "level 3"]:
                 if candidate in normalized_cols:
                     level3_col = normalized_cols[candidate]
                     break
-            if not level3_col:
+            if not level2_col and not level3_col:
                 continue
             values = []
-            for value in df[level3_col].dropna().tolist():
-                text = _clean_cell(value)
-                if text:
-                    values.append(text)
+            for col in [level2_col, level3_col]:
+                if not col:
+                    continue
+                for value in df[col].dropna().tolist():
+                    text = _clean_cell(value)
+                    if text:
+                        values.append(text)
+            values.extend(STRONG_TREATMENT_CATALOG)
             unique_values = sorted(set(values), key=lambda x: len(x), reverse=True)
             if unique_values:
                 logger.info("Tratamientos Nivel 3 cargados desde %s (hoja=%s, filas=%s)", path, TREATMENT_CATALOG_SHEET, len(unique_values))
@@ -2193,6 +2293,11 @@ def choose_canonical_treatment(extracted_treatment: str, known_treatments: List[
     a = _normalize_for_match(raw)
     if not a:
         return raw
+    for term in known_treatments:
+        if _normalize_for_match(term) == a:
+            return term
+    if len(a.split()) <= 2:
+        return raw
     best_term = raw
     best_score = 0.0
     for term in known_treatments:
@@ -2204,6 +2309,100 @@ def choose_canonical_treatment(extracted_treatment: str, known_treatments: List[
             best_score = score
             best_term = term
     return best_term if best_score >= threshold else raw
+
+
+PRETREATMENT_SIGNAL_STOPWORDS = {
+    "pretratamiento",
+    "de",
+    "del",
+    "la",
+    "el",
+    "los",
+    "las",
+    "y",
+    "o",
+    "u",
+    "que",
+    "no",
+    "con",
+    "sin",
+    "para",
+    "por",
+    "al",
+    "a",
+    "en",
+    "que",
+    "contiene",
+    "contienen",
+    "sustancias",
+    "peligrosas",
+    "fuera",
+    "uso",
+    "residuo",
+    "residuos",
+}
+
+
+def _pretratamiento_signal_tokens(term: str) -> List[str]:
+    tokens: List[str] = []
+    for token in _normalize_for_match(term).split():
+        if token in PRETREATMENT_SIGNAL_STOPWORDS or len(token) < 4:
+            continue
+        if token not in tokens:
+            tokens.append(token)
+    return tokens
+
+
+def _infer_specific_pretratamiento(
+    current_treatment: str,
+    context_text: str,
+    known_treatments: Optional[List[str]] = None,
+    require_pretratamiento_keyword: bool = False,
+) -> str:
+    raw = _clean_cell(current_treatment)
+    raw_norm = _normalize_for_match(raw)
+    if raw_norm and raw_norm not in {"pretratamiento", "pretratamiento de"}:
+        return raw
+
+    context = _clean_cell(context_text)
+    if not context:
+        return raw
+    context_norm = _normalize_for_match(context)
+    if require_pretratamiento_keyword and "pretratamiento" not in context_norm:
+        return raw
+
+    treatment_catalog = list(dict.fromkeys((known_treatments or []) + STRONG_TREATMENT_CATALOG))
+    context_tokens = set(context_norm.split())
+    best_term = ""
+    best_score = (0, 0.0, 0)
+    second_score = (0, 0.0, 0)
+
+    for term in sorted(treatment_catalog, key=lambda x: len(x), reverse=True):
+        term_norm = _normalize_for_match(term)
+        if not term_norm or not term_norm.startswith("pretratamiento"):
+            continue
+        if term_norm == "pretratamiento":
+            continue
+        if term_norm in context_norm:
+            return term
+
+        signal_tokens = _pretratamiento_signal_tokens(term)
+        if not signal_tokens:
+            continue
+        matched_tokens = {token for token in signal_tokens if token in context_tokens}
+        if not matched_tokens:
+            continue
+        score = (len(matched_tokens), len(matched_tokens) / len(signal_tokens), len(signal_tokens))
+        if score > best_score:
+            second_score = best_score
+            best_score = score
+            best_term = term
+        elif score > second_score:
+            second_score = score
+
+    if best_term and (best_score[0] >= 2 or (best_score[0] == 1 and second_score[0] == 0)):
+        return best_term
+    return raw
 
 
 def load_treatment_alias_map(training_files: Optional[List[str]] = None) -> Dict[str, str]:
@@ -2327,6 +2526,26 @@ def defra_classification(desc_residuo: str, sin_movimientos: str = "", codigo_pr
         return "Household residual waste" if has_any("relleno sanitario", "residuo domiciliario", "residual") else "Commercial and industrial waste"
     if cod == "10 01 01":
         return "Commercial and industrial waste"
+    if cod == "21 04 01":
+        return "Organic: food and drink waste"
+    if cod in {"16 12 02", "16 12 03"}:
+        return "Commercial and industrial waste"
+    if cod == "20 03 01":
+        return "Household residual waste"
+    if cod == "20 01 01":
+        return "Paper and board: mixed"
+    if cod == "20 01 02":
+        return "Glass"
+    if cod == "20 01 25":
+        return "Organic: food and drink waste"
+    if cod == "20 01 38":
+        return "Wood"
+    if cod == "21 04 02":
+        if has_any("poliestireno", "boyas", "flotadores", "greenspot", "aysen recircular"):
+            return "Plastics: PS (incl. forming)"
+        return "Plastics: average plastics"
+    if cod in {"21 04 03", "21 04 05"}:
+        return "Plastics: average plastics"
     if has_any("envases de papel y carton", "envases de papel y cartón"):
         return "Paper and board: mixed"
     if has_any("papel") and not has_any("carton", "cartón", "board"):
@@ -2524,6 +2743,30 @@ def clasificar_defra_residuo(codigo_residuo: str, residuo_oficial: str) -> Optio
         return "Commercial and industrial waste"
     if codigo == "10 01 01":
         return "Commercial and industrial waste"
+    if codigo == "21 04 01":
+        return "Organic: food and drink waste"
+    if codigo in {"16 12 02", "16 12 03"}:
+        return "Commercial and industrial waste"
+    if codigo == "20 03 01":
+        return "Household residual waste"
+    if codigo == "20 01 01":
+        return "Paper and board: mixed"
+    if codigo == "20 01 02":
+        return "Glass"
+    if codigo == "20 01 25":
+        return "Organic: food and drink waste"
+    if codigo == "20 01 38":
+        return "Wood"
+    if codigo == "20 01 39":
+        return "Plastics: average plastics"
+    if codigo == "20 01 40":
+        return "Metals"
+    if codigo == "21 04 02":
+        if "poliestireno" in residuo_norm or "boyas" in residuo_norm or "flotadores" in residuo_norm:
+            return "Plastics: PS (incl. forming)"
+        return "Plastics: average plastics"
+    if codigo in {"21 04 03", "21 04 05"}:
+        return "Plastics: average plastics"
     if codigo == "21 04 04":
         return "Plastics: average plastics"
     if codigo == "02 01 99":
@@ -2561,6 +2804,8 @@ def clasificar_defra_tratamiento(tratamiento: str) -> Optional[str]:
         return "Landfill"
     if "residuos municipales asimilables a domiciliarios" in txt or "sitio de escombros de la construccion" in txt:
         return "Landfill"
+    if "reutilizacion" in txt:
+        return "Re-use"
     if "reciclaje" in txt:
         return "Open-loop"
     if "pretratamiento" in txt:
@@ -2632,6 +2877,20 @@ def process_folder(input_folder: str, output_excel: str) -> pd.DataFrame:
     if "Tratamiento" in df.columns and known_treatments:
         if "Tratamiento Original" not in df.columns:
             df["Tratamiento Original"] = df["Tratamiento"]
+        def _resolve_row_specific_pretratamiento(row: pd.Series) -> str:
+            context = " ".join(
+                _clean_cell(part)
+                for part in [
+                    row.get("Tratamiento", ""),
+                    row.get("Descripción Residuo", ""),
+                    row.get("Residuo extraído", ""),
+                    row.get("Texto fila original", ""),
+                ]
+                if _clean_cell(part)
+            )
+            return _infer_specific_pretratamiento(row.get("Tratamiento", ""), context, known_treatments)
+
+        df["Tratamiento"] = df.apply(_resolve_row_specific_pretratamiento, axis=1)
         df["Tratamiento"] = df["Tratamiento"].apply(
             lambda x: treatment_alias_map.get(_norm(_clean_cell(x)), choose_canonical_treatment(x, known_treatments))
         )
