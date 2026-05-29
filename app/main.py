@@ -179,8 +179,12 @@ def save_uploaded_pdfs(files: List[UploadFile], input_dir: Path) -> int:
                 ),
             )
 
-        safe_name = f"{idx:03d}_{uuid4().hex}_{original_name}"
-        dst = input_dir / safe_name
+        parts = _safe_relative_parts(uploaded.filename)
+        if not parts:
+            parts = [original_name]
+        parts[-1] = f"{idx:03d}_{uuid4().hex}_{parts[-1]}"
+        dst = input_dir.joinpath(*parts)
+        dst.parent.mkdir(parents=True, exist_ok=True)
 
         with dst.open("wb") as buffer:
             shutil.copyfileobj(uploaded.file, buffer)

@@ -157,10 +157,20 @@ def _render_header() -> None:
 def _save_uploads(uploaded_files: Iterable[object], input_dir: Path) -> int:
     count = 0
     for idx, upload in enumerate(uploaded_files, start=1):
-        filename = Path(upload.name).name
-        if Path(filename).suffix.lower() != ".pdf":
+        filename = getattr(upload, "name", "")
+        if not filename:
             continue
-        dst = input_dir / f"{idx:03d}_{filename}"
+        original_name = Path(filename).name
+        if original_name.startswith("~$"):
+            continue
+        if Path(original_name).suffix.lower() != ".pdf":
+            continue
+        parts = _safe_relative_parts(filename)
+        if not parts:
+            parts = [original_name]
+        parts[-1] = f"{idx:03d}_{parts[-1]}"
+        dst = input_dir.joinpath(*parts)
+        dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_bytes(upload.getbuffer())
         count += 1
     return count
@@ -189,13 +199,13 @@ def _render_preview_from_excel(path: Path, title: str) -> None:
     st.markdown(f"#### 👀 Previsualización — {title}")
     if title.upper() == "SINADER":
         preferred = [c for c in [
-            "FuentePDF", "Código principal", "Residuo oficial", "residuo", "Descripción Residuo",
+            "FuentePDF", "Instalación", "Código principal", "Residuo oficial", "residuo", "Descripción Residuo",
             "Cantidad (Kg)", "Tratamiento",
             "DEFRA_Residuo", "DEFRA_Residuo_ES", "DEFRA",
         ] if c in df.columns]
     else:
         preferred = [c for c in [
-            "FuentePDF", "N.", "Descripción Residuo", "Código principal", "Cantidad (Kg)",
+            "FuentePDF", "Instalación", "N.", "Descripción Residuo", "Código principal", "Cantidad (Kg)",
             "Tratamiento", "Destino", "Transportista", "Patente",
             "DEFRA_English", "DEFRA_Español", "Clasificación DEFRA", "DEFRA",
         ] if c in df.columns]
@@ -440,7 +450,7 @@ def main() -> None:
                     zip_upload.getvalue(),
                     input_dir,
                     allowed_suffixes=allowed_suffixes,
-                    preserve_tree=source == "SIMAPRO",
+                    preserve_tree=True,
                 )
                 if total == 0:
                     st.warning(zip_empty_warning)
